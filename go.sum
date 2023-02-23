@@ -1,0 +1,6 @@
+github.com/jfjallid/go-smb v0.1.1 h1:QiTKOWwpkyqS4I+fMZd4Ex0m41vSWyLd65JR9kkXi7o=
+github.com/jfjallid/go-smb v0.1.1/go.mod h1:Kew0ysf3f+GtnBzpU7jiZmZ4ohp4ZHE7z2PMnXXG7IM=
+github.com/jfjallid/golog v0.3.1 h1:o+gCUDClhOzcxpboLlbQeP/E/TfMlr6lQFvOD8JC5BY=
+github.com/jfjallid/golog v0.3.1/go.mod h1:19Q/zg5OgPPd0xhFllokPnMzthzhFPZmiAGAokE7k58=
+golang.org/x/crypto v0.6.0 h1:qfktjS5LUO+fFKeJXZ+ikTRijMmljikvG68fpMMruSc=
+golang.org/x/crypto v0.6.0/go.mod h1:OFC/31mSvZgRz0V1QTNCzfAI1aIRzbiufJtkMIlEp58=
