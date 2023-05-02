@@ -1,6 +1,10 @@
-github.com/jfjallid/go-smb v0.1.1 h1:QiTKOWwpkyqS4I+fMZd4Ex0m41vSWyLd65JR9kkXi7o=
-github.com/jfjallid/go-smb v0.1.1/go.mod h1:Kew0ysf3f+GtnBzpU7jiZmZ4ohp4ZHE7z2PMnXXG7IM=
+github.com/jfjallid/go-smb v0.2.1 h1:b4mjFjPepriEgSu8EhGkBXGzDmHQG/cwjPerSdnUs9E=
+github.com/jfjallid/go-smb v0.2.1/go.mod h1:Kew0ysf3f+GtnBzpU7jiZmZ4ohp4ZHE7z2PMnXXG7IM=
 github.com/jfjallid/golog v0.3.1 h1:o+gCUDClhOzcxpboLlbQeP/E/TfMlr6lQFvOD8JC5BY=
 github.com/jfjallid/golog v0.3.1/go.mod h1:19Q/zg5OgPPd0xhFllokPnMzthzhFPZmiAGAokE7k58=
 golang.org/x/crypto v0.6.0 h1:qfktjS5LUO+fFKeJXZ+ikTRijMmljikvG68fpMMruSc=
 golang.org/x/crypto v0.6.0/go.mod h1:OFC/31mSvZgRz0V1QTNCzfAI1aIRzbiufJtkMIlEp58=
+golang.org/x/sys v0.5.0 h1:MUK/U/4lj1t1oPg0HfuXDN/Z1wv31ZJ/YcPiGccS4DU=
+golang.org/x/sys v0.5.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/term v0.5.0 h1:n2a8QNdAb0sZNpU9R1ALUXBbY+w51fCQDN+7EdxNBsY=
+golang.org/x/term v0.5.0/go.mod h1:jMB1sMXY+tzblOD4FWmEbocvup2/aLOaQEp7JmGp78k=

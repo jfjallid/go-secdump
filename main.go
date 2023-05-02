@@ -22,13 +22,13 @@
 package main
 
 import (
-	"bufio"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
@@ -58,15 +58,31 @@ func startRemoteRegistry(session *smb.Connection, share string) (err error) {
 	status, err := bind.GetServiceStatus(serviceName)
 	if err != nil {
 		log.Errorln(err)
-		return
-	}
-	if status != dcerpc.ServiceRunning {
+		return err
+	} else {
+		if status == dcerpc.ServiceRunning {
+			return nil
+		}
+		// Check if disabled
+		config, err := bind.GetServiceConfig(serviceName)
+		if err != nil {
+			log.Errorf("Failed to get config of %s service with error: %v\n", serviceName, err)
+			return err
+		}
+		if config.StartType == dcerpc.StartTypeStatusMap[dcerpc.ServiceDisabled] {
+			// Enable service
+			err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDemandStart, dcerpc.ServiceNoChange, "", "", "")
+			if err != nil {
+				log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
+				return err
+			}
+		}
+		// Start service
 		err = bind.StartService(serviceName)
 		if err != nil {
 			log.Errorln(err)
-			return
+			return err
 		}
-		// Wait for pipe to be created
 		time.Sleep(time.Second)
 	}
 	return nil
@@ -178,18 +194,37 @@ func main() {
 	debug := flag.Bool("debug", false, "enable debugging")
 	noEnc := flag.Bool("noenc", false, "disable smb encryption")
 	forceSMB2 := flag.Bool("smb2", false, "Force smb 2.1")
+	localUser := flag.Bool("local", false, "Authenticate as a local user instead of domain user")
+	dialTimeout := flag.Int("timeout", 5, "Dial timeout in seconds")
 
-	//log.Set("github.com/jfjallid/go-smb/smb", log.LevelError, log.LstdFlags|log.Lshortfile, log.DefaultOutput)
-	//log.Set("github.com/jfjallid/go-smb/smb/dcerpc", log.LevelDebug, log.LstdFlags|log.Lshortfile, log.DefaultOutput)
-	//log.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", log.LevelDebug, log.LstdFlags|log.Lshortfile, log.DefaultOutput)
-	//log.SetFlags(golog.LstdFlags | golog.Lshortfile)
+	flag.Parse()
+
+	if *debug {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
+		log.SetLogLevel(golog.LevelDebug)
+	} else {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
+	}
+
 	share := ""
 	var hashBytes []byte
 	var err error
 
-	flag.Parse()
 	if *host == "" {
 		log.Errorln("Must specify a hostname")
+		flag.Usage()
+		return
+	}
+
+	if *dialTimeout < 1 {
+		log.Errorln("Valid value for the timeout is > 0 seconds")
 		return
 	}
 
@@ -203,33 +238,37 @@ func main() {
 	}
 
 	if (*password == "") && (hashBytes == nil) {
-		reader := bufio.NewReader(os.Stdin)
 		fmt.Printf("Enter password: ")
-		pass, err := reader.ReadString('\n')
+		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
 		if err != nil {
 			log.Errorln(err)
 			return
 		}
-        pass = strings.TrimSuffix(pass, "\n") // Remove Linux newline
-        pass = strings.TrimSuffix(pass, "\r") // Remove Windows Carriage Return
-		*password = pass
+		*password = string(passBytes)
 	}
 
+	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", *dialTimeout))
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
 	options := smb.Options{
 		Host: *host,
 		Port: *port,
 		Initiator: &smb.NTLMInitiator{
-			User:        *username,
-			Password:    *password,
-			Hash:        hashBytes,
-			Domain:      *domain,
-			Workstation: "",
+			User:      *username,
+			Password:  *password,
+			Hash:      hashBytes,
+			Domain:    *domain,
+			LocalUser: *localUser,
 		},
 		DisableEncryption: *noEnc,
 		ForceSMB2:         *forceSMB2,
+		DialTimeout:       timeout,
 	}
 
-	session, err := smb.NewConnection(options, *debug)
+	session, err := smb.NewConnection(options)
 	if err != nil {
 		log.Criticalln(err)
 		return
