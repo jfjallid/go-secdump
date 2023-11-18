@@ -28,6 +28,8 @@ import (
 	"os"
 	"time"
 
+	rundebug "runtime/debug"
+
 	"golang.org/x/term"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -37,6 +39,7 @@ import (
 )
 
 var log = golog.Get("")
+var release string = "0.1.1"
 
 func startRemoteRegistry(session *smb.Connection, share string) (err error) {
 	f, err := session.OpenFile(share, "svcctl")
@@ -184,52 +187,98 @@ func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string, m map[
 	return nil
 }
 
+var helpMsg = `
+    Usage: ` + os.Args[0] + ` [options]
+
+    options:
+          --host                Hostname or ip address of remote server
+      -P, --port                SMB Port (default 445)
+      -d, --domain              Domain name to use for login
+      -u, --user                Username
+      -p, --pass                Password
+          --hash                Hex encoded NT Hash for user password
+          --local               Authenticate as a local user instead of domain user
+      -t, --timeout             Dial timeout in seconds (default 5)
+          --noenc               Disable smb encryption
+          --smb2                Force smb 2.1
+          --debug               Enable debug logging
+      -v, --version             Show version
+`
+
 func main() {
-	host := flag.String("host", "", "host")
-	username := flag.String("user", "", "username")
-	password := flag.String("pass", "", "password")
-	hash := flag.String("hash", "", "hex encoded NT Hash for user")
-	domain := flag.String("d", "", "domain")
-	port := flag.Int("port", 445, "SMB Port")
-	debug := flag.Bool("debug", false, "enable debugging")
-	noEnc := flag.Bool("noenc", false, "disable smb encryption")
-	forceSMB2 := flag.Bool("smb2", false, "Force smb 2.1")
-	localUser := flag.Bool("local", false, "Authenticate as a local user instead of domain user")
-	dialTimeout := flag.Int("timeout", 5, "Dial timeout in seconds")
+	var host, username, password, hash, domain string
+	var port, dialTimeout int
+	var debug, noEnc, forceSMB2, localUser, version bool
+	var err error
+
+	flag.Usage = func() {
+		fmt.Println(helpMsg)
+		os.Exit(0)
+	}
+
+	flag.StringVar(&host, "host", "", "host")
+	flag.StringVar(&username, "u", "", "username")
+	flag.StringVar(&username, "user", "", "username")
+	flag.StringVar(&password, "p", "", "password")
+	flag.StringVar(&password, "pass", "", "password")
+	flag.StringVar(&hash, "hash", "", "hex encoded NT Hash for user")
+	flag.StringVar(&domain, "d", "", "domain")
+	flag.StringVar(&domain, "domain", "", "domain")
+	flag.IntVar(&port, "P", 445, "SMB Port")
+	flag.IntVar(&port, "port", 445, "SMB Port")
+	flag.BoolVar(&debug, "debug", false, "enable debugging")
+	flag.BoolVar(&noEnc, "noenc", false, "disable smb encryption")
+	flag.BoolVar(&forceSMB2, "smb2", false, "Force smb 2.1")
+	flag.BoolVar(&localUser, "local", false, "Authenticate as a local user instead of domain user")
+	flag.IntVar(&dialTimeout, "t", 5, "Dial timeout in seconds")
+	flag.IntVar(&dialTimeout, "timeout", 5, "Dial timeout in seconds")
+	flag.BoolVar(&version, "v", false, "Show version")
+	flag.BoolVar(&version, "version", false, "Show version")
 
 	flag.Parse()
 
-	if *debug {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput)
+	if debug {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
 	} else {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+	}
+
+	if version {
+		fmt.Printf("Version: %s\n", release)
+		bi, ok := rundebug.ReadBuildInfo()
+		if !ok {
+			log.Errorln("Failed to read build info to locate version imported modules")
+		}
+		for _, m := range bi.Deps {
+			fmt.Printf("Package: %s, Version: %s\n", m.Path, m.Version)
+		}
+		return
 	}
 
 	share := ""
 	var hashBytes []byte
-	var err error
 
-	if *host == "" {
+	if host == "" {
 		log.Errorln("Must specify a hostname")
 		flag.Usage()
 		return
 	}
 
-	if *dialTimeout < 1 {
+	if dialTimeout < 1 {
 		log.Errorln("Valid value for the timeout is > 0 seconds")
 		return
 	}
 
-	if *hash != "" {
-		hashBytes, err = hex.DecodeString(*hash)
+	if hash != "" {
+		hashBytes, err = hex.DecodeString(hash)
 		if err != nil {
 			fmt.Println("Failed to decode hash")
 			log.Errorln(err)
@@ -237,7 +286,7 @@ func main() {
 		}
 	}
 
-	if (*password == "") && (hashBytes == nil) {
+	if (password == "") && (hashBytes == nil) {
 		fmt.Printf("Enter password: ")
 		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
@@ -245,26 +294,26 @@ func main() {
 			log.Errorln(err)
 			return
 		}
-		*password = string(passBytes)
+		password = string(passBytes)
 	}
 
-	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", *dialTimeout))
+	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
 	options := smb.Options{
-		Host: *host,
-		Port: *port,
+		Host: host,
+		Port: port,
 		Initiator: &smb.NTLMInitiator{
-			User:      *username,
-			Password:  *password,
+			User:      username,
+			Password:  password,
 			Hash:      hashBytes,
-			Domain:    *domain,
-			LocalUser: *localUser,
+			Domain:    domain,
+			LocalUser: localUser,
 		},
-		DisableEncryption: *noEnc,
-		ForceSMB2:         *forceSMB2,
+		DisableEncryption: noEnc,
+		ForceSMB2:         forceSMB2,
 		DialTimeout:       timeout,
 	}
 
@@ -275,7 +324,7 @@ func main() {
 	}
 	defer session.Close()
 
-	if session.IsSigningRequired {
+	if session.IsSigningRequired.Load() {
 		log.Noticeln("[-] Signing is required")
 	} else {
 		log.Noticeln("[+] Signing is NOT required")

@@ -36,25 +36,22 @@ https://social.technet.microsoft.com/Forums/en-US/6e3c4486-f3a1-4d4e-9f5c-bdacdb
 
 ## Usage
 ```
-Usage of ./go-secdump:
-  -d string
-    	domain
-  -debug
-    	enable debugging
-  -hash string
-    	hex encoded NT Hash for user
-  -host string
-    	host
-  -noenc
-    	disable smb encryption
-  -pass string
-    	password
-  -port int
-    	SMB Port (default 445)
-  -smb2
-    	Force smb 2.1
-  -user string
-    	username
+Usage: ./go-secdump [options]
+
+options:
+      --host                Hostname or ip address of remote server
+  -P, --port                SMB Port (default 445)
+  -d, --domain              Domain name to use for login
+  -u, --user                Username
+  -p, --pass                Password
+      --hash                Hex encoded NT Hash for user password
+      --local               Authenticate as a local user instead of domain user
+  -t, --timeout             Dial timeout in seconds (default 5)
+      --noenc               Disable smb encryption
+      --smb2                Force smb 2.1
+      --debug               Enable debug logging
+  -v, --version             Show version
+
 ```
 
 ## Examples
@@ -62,5 +59,5 @@ Usage of ./go-secdump:
 Dump registry secrets
 
 ```
-./go-secdump --host DESKTOP-AIG0C1D2 -user Administrator -pass adminPass123
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local
 ```
