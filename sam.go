@@ -103,6 +103,80 @@ func (self *dpapi_system) unmarshal(data []byte) {
 	copy(self.UserKey[:], data[24:44])
 }
 
+type sam_key_data_aes struct {
+	Revision    uint32
+	Length      uint32
+	ChecksumLen uint32
+	DataLen     uint32
+	Salt        [16]byte
+	Data        [32]byte
+}
+
+type sam_key_data struct {
+	Revision uint32
+	Length   uint32
+	Salt     [16]byte
+	Key      [16]byte
+	Checksum [16]byte
+	_        uint64
+}
+
+type domain_account_f struct { // 104 bytes of fixed length fields
+	Revision                     uint16
+	_                            uint32 // Unknown
+	_                            uint16 // Unknown
+	CreationTime                 uint64
+	DomainModifiedAccount        uint64
+	MaxPasswordAge               uint64
+	MinPasswordAge               uint64
+	ForceLogoff                  uint64
+	LockoutDuration              uint64
+	LockoutObservationWindow     uint64
+	ModifiedCountAtLastPromotion uint64
+	NextRid                      uint32
+	PasswordProperties           uint32
+	MinPasswordLength            uint16
+	PasswordHistoryLength        uint16
+	LockoutThreshold             uint16
+	_                            uint16 // Unknown
+	ServerState                  uint32
+	ServerRole                   uint32
+	UasCompatibilityRequired     uint32
+	_                            uint32 // Unknown
+	Data                         []byte
+}
+
+func (self *domain_account_f) unmarshal(data []byte) (err error) {
+	if len(data) < 104 {
+		err = fmt.Errorf("Not enough data to unmarshal a DOMAIN_ACCOUNT_F")
+		log.Errorln(err)
+		return
+	}
+
+	self.Revision = binary.LittleEndian.Uint16(data[:2])
+	self.CreationTime = binary.LittleEndian.Uint64(data[8:16])
+	self.DomainModifiedAccount = binary.LittleEndian.Uint64(data[16:24])
+	self.MaxPasswordAge = binary.LittleEndian.Uint64(data[24:32])
+	self.MinPasswordAge = binary.LittleEndian.Uint64(data[32:40])
+	self.ForceLogoff = binary.LittleEndian.Uint64(data[40:48])
+	self.LockoutDuration = binary.LittleEndian.Uint64(data[48:56])
+	self.LockoutObservationWindow = binary.LittleEndian.Uint64(data[56:64])
+	self.ModifiedCountAtLastPromotion = binary.LittleEndian.Uint64(data[64:72])
+	self.NextRid = binary.LittleEndian.Uint32(data[72:76])
+	self.PasswordProperties = binary.LittleEndian.Uint32(data[76:80])
+	self.MinPasswordLength = binary.LittleEndian.Uint16(data[80:82])
+	self.PasswordHistoryLength = binary.LittleEndian.Uint16(data[82:84])
+	self.LockoutThreshold = binary.LittleEndian.Uint16(data[84:86])
+	self.ServerState = binary.LittleEndian.Uint32(data[88:92])
+	self.ServerRole = binary.LittleEndian.Uint32(data[92:96])
+	self.UasCompatibilityRequired = binary.LittleEndian.Uint32(data[96:100])
+	if len(data) > 104 {
+		self.Data = make([]byte, len(data[104:]))
+		copy(self.Data, data[104:])
+	}
+	return
+}
+
 type nl_record struct {
 	UserLength               uint16
 	DomainNameLength         uint16
@@ -418,35 +492,6 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 	return
 }
 
-func getEncryptedsysKey(rpccon *msrrp.RPCCon, base, f []byte) (encsysKey []byte, err error) {
-
-	val, err := IsWin10After1607(GetOSVersionBuild(rpccon, base))
-	if err != nil {
-		return
-	}
-	if val {
-		log.Debugf("Getting AES encrypted sysKey from F[0x88]\n")
-		encsysKey = f[0x88 : 0x88+16]
-	} else {
-		encsysKey = f[0x80 : 0x80+16]
-	}
-	return
-}
-
-func getEncryptedsysKeyIV(rpccon *msrrp.RPCCon, base, f []byte) (sysKeyIV []byte, err error) {
-	val, err := IsWin10After1607(GetOSVersionBuild(rpccon, base))
-	if err != nil {
-		return
-	}
-	if val {
-		log.Debugf("Getting sysKey IV from F[0x78]\n")
-		sysKeyIV = f[0x78 : 0x78+16]
-	} else {
-		sysKeyIV = f[0x70 : 0x70+16]
-	}
-	return
-}
-
 func getSysKey(rpccon *msrrp.RPCCon, base []byte) (sysKey []byte, err error) {
 	var tmpSysKey []byte
 	_, err = getBootKey(rpccon, base)
@@ -459,7 +504,7 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte) (sysKey []byte, err error) {
 		return
 	}
 
-	f, err := rpccon.QueryValue(hSubKey, "F")
+	fBytes, err := rpccon.QueryValue(hSubKey, "F")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -468,61 +513,97 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte) (sysKey []byte, err error) {
 
 	rpccon.CloseKeyHandle(hSubKey)
 
-	encsysKey, err := getEncryptedsysKey(rpccon, base, f)
+	f := &domain_account_f{}
+	err = f.unmarshal(fBytes)
 	if err != nil {
-		return
-	}
-	sysKeyIV, err := getEncryptedsysKeyIV(rpccon, base, f)
-	if err != nil {
+		log.Errorln(err)
+		rpccon.CloseKeyHandle(hSubKey)
 		return
 	}
 
-	if f[0] == 0x3 {
-		tmpSysKey, err = DecryptAESSysKey(BootKey, encsysKey, sysKeyIV)
+	var encSysKey []byte
+	var sysKeyIV []byte
+	sysKey = make([]byte, 16)
+
+	if f.Revision == 3 {
+		// AES
+		samAesData := sam_key_data_aes{}
+		err = binary.Read(bytes.NewReader(f.Data), binary.LittleEndian, &samAesData)
+		if err != nil {
+			log.Errorln(err)
+			rpccon.CloseKeyHandle(hSubKey)
+			return
+		}
+		sysKeyIV = samAesData.Salt[:]
+		encSysKey = samAesData.Data[:samAesData.DataLen]
+		tmpSysKey, err = DecryptAESSysKey(BootKey, encSysKey, sysKeyIV)
+		copy(sysKey, tmpSysKey)
+	} else if f.Revision == 2 {
+		// RC4
+		samData := &sam_key_data{}
+		err = binary.Read(bytes.NewReader(f.Data), binary.LittleEndian, samData)
+		if err != nil {
+			log.Errorln(err)
+			rpccon.CloseKeyHandle(hSubKey)
+			return
+		}
+
+		sysKeyIV = samData.Salt[:]
+		// For RC4, also check the checksum so we should XOR 32 bytes instead of just 16
+		encSysKey = append(samData.Key[:], samData.Checksum[:]...)
+		tmpSysKey, err = DecryptRC4SysKey(BootKey, encSysKey, sysKeyIV)
+		// Verify checksum
+		input := []byte{}
+		input = append(input, tmpSysKey[:16]...)
+		input = append(input, s2...)
+		input = append(input, tmpSysKey[:16]...)
+		input = append(input, s1...)
+		checksum := md5.Sum(input)
+		if bytes.Compare(checksum[:], tmpSysKey[16:]) != 0 {
+			err = fmt.Errorf("Syskey checksum failed. Could be that a Syskey startup password is in use.")
+			log.Errorln(err)
+			return
+		}
+		copy(sysKey, tmpSysKey[:16])
 	} else {
-		tmpSysKey, err = DecryptRC4SysKey(BootKey, encsysKey, sysKeyIV)
-	}
-	if err != nil {
+		err = fmt.Errorf("Unknown revision of DOMAIN_ACCOUNT_F")
 		log.Errorln(err)
 		return
 	}
-	sysKey = make([]byte, len(tmpSysKey))
-	copy(sysKey, tmpSysKey)
+
 	log.Noticef("SysKey: 0x%x\n", sysKey)
 	return
 }
 
-func DecryptRC4SysKey(bootkey, encSyskey, syskeyIV []byte) (syskey []byte, err error) {
+func DecryptRC4SysKey(bootKey, encSysKey, sysKeyIV []byte) (sysKey []byte, err error) {
 	// Building the decryption key for the Syskey
 	input := []byte{}
-	input = append(input, syskeyIV...)
+	input = append(input, sysKeyIV...)
 	input = append(input, s1...)
-	input = append(input, bootkey...)
+	input = append(input, bootKey...)
 	input = append(input, s2...)
-	// Building syskey RC4 enc key with: one byte from F[0x70], String1, Bootkey, String2
 	rc4key := md5.Sum(input)
-	log.Debugf("Syskey RC4 enc key: md5(%x %x %x %x)\n", syskeyIV, s1, bootkey, s2)
+	log.Debugf("Syskey RC4 enc key: md5(%x %q %x %q)\n", sysKeyIV, s1, bootKey, s2)
 	log.Debugf("Syskey RC4 enc key: %x\n", rc4key)
 	c1, err := rc4.NewCipher(rc4key[:])
 	if err != nil {
 		log.Errorln("Failed to init RC4 key")
 		return
 	}
-	syskey = make([]byte, 16)
-	c1.XORKeyStream(syskey, encSyskey)
-	log.Debugf("Syskey: %x\n", syskey)
+	sysKey = make([]byte, 32)
+	c1.XORKeyStream(sysKey, encSysKey)
 	return
 }
 
-func DecryptAESSysKey(bootkey, encSyskey, syskeyIV []byte) (syskey []byte, err error) {
-	syskey = make([]byte, 16)
-	a1, err := aes.NewCipher(bootkey)
+func DecryptAESSysKey(bootKey, encSysKey, sysKeyIV []byte) (sysKey []byte, err error) {
+	sysKey = make([]byte, len(encSysKey))
+	a1, err := aes.NewCipher(bootKey)
 	if err != nil {
 		log.Errorln("Failed to init AES key")
 		return
 	}
-	c1 := cipher.NewCBCDecrypter(a1, syskeyIV)
-	c1.CryptBlocks(syskey, encSyskey)
+	c1 := cipher.NewCBCDecrypter(a1, sysKeyIV)
+	c1.CryptBlocks(sysKey, encSysKey)
 	return
 }
 
@@ -532,6 +613,14 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 	// Some entires have empty passwords or hash retrieval fails for some reason.
 	// In those cases I skip to the next entry. I increment the ctr first thing
 	// instead of at the end of the loop to make sure it happens
+
+	// Determine OS version once
+	osBuild, osVersion, isServer, err := GetOSVersionBuild(rpccon, base)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+
 	cntr := -1
 	for _, ridStr := range rids {
 		cntr += 1
@@ -632,7 +721,7 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 		szNT := binary.LittleEndian.Uint32(v[0xac:])
 		offsetHashStruct := binary.LittleEndian.Uint32(v[0xa8:]) + 0xcc
 		//log.Debugf("Size of SAM Hash structure for user %s: %d located at offset: 0x%x\n", name, szNT, offsetHashStruct)
-		preWin11, err2 := IsBetweenWinXPWin10(GetOSVersionBuild(rpccon, base))
+		preWin11, err2 := IsBetweenWinXPWin10(osBuild, osVersion, isServer)
 		if err2 != nil {
 			log.Errorln(err2)
 			continue
@@ -644,7 +733,7 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 			result[cntr].AES = false
 			result[cntr].Data = v[offsetNTHash : offsetNTHash+16]
 		} else {
-			afterAnniversary, err2 := IsWin10After1607(GetOSVersionBuild(rpccon, base))
+			afterAnniversary, err2 := IsWin10After1607(osBuild, osVersion)
 			if err2 != nil {
 				log.Errorln(err2)
 				continue
@@ -669,7 +758,7 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 					result[cntr].AES = false
 					result[cntr].Data = []byte{}
 				} else {
-					log.Warningf("Unknown Hash type for %x with length 0x%x with OS: %s\n", rid, szNT, GetOsVersionName(GetOSVersionBuild(rpccon, base)))
+					log.Warningf("Unknown Hash type for %x with length 0x%x with OS: %s\n", rid, szNT, osNameMap[GetOSVersion(osBuild, osVersion, isServer)])
 				}
 			}
 		}
@@ -1046,13 +1135,15 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte) (result []string, err er
 	return
 }
 
-func GetOSVersionBuild(rpccon *msrrp.RPCCon, base []byte) (build int, version float64, err error) {
+func GetOSVersionBuild(rpccon *msrrp.RPCCon, base []byte) (build int, version float64, server bool, err error) {
 	hSubKey, err := rpccon.OpenSubKey(base, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`)
 	if err != nil {
 		log.Noticef("Failed to open registry key CurrentVersion with error: %v\n", err)
 		return
 	}
-	defer rpccon.CloseKeyHandle(hSubKey)
+	defer func(h []byte) {
+		rpccon.CloseKeyHandle(h)
+	}(hSubKey)
 
 	value, err := rpccon.QueryValueString(hSubKey, "CurrentBuild")
 	if err != nil {
@@ -1076,6 +1167,25 @@ func GetOSVersionBuild(rpccon *msrrp.RPCCon, base []byte) (build int, version fl
 	if err != nil {
 		log.Errorf("Failed to get CurrentVersion with error: %v\n", err)
 		return
+	}
+
+	hSubKey, err = rpccon.OpenSubKey(base, `SYSTEM\CurrentControlSet\Control\ProductOptions`)
+	if err != nil {
+		log.Noticef("Failed to open registry key ProductOptions with error: %v\n", err)
+		return
+	}
+	defer func(h []byte) {
+		rpccon.CloseKeyHandle(h)
+	}(hSubKey)
+
+	value, err = rpccon.QueryValueString(hSubKey, "ProductType")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+
+	if strings.Compare(value, "ServerNT") == 0 {
+		server = true
 	}
 
 	return

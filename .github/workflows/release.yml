@@ -1,0 +1,39 @@
+# This workflow will build binaries for Linux and Windows x64 architecture
+
+name: release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    permissions:
+      contents: write # to allow upload of release assets
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout repo
+      uses: actions/checkout@v4
+
+    - name: set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.20'
+
+    - name: install dependencies
+      run: go get
+
+    - name: build project
+      run: make
+
+    - name: publish binaries to release
+      run: |
+        ASSET_NAME_1="go-secdump"
+        ASSET_NAME_2="go-secdump.exe"
+        UPLOAD_URL="https://uploads.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets"
+
+        # Upload asset 1
+        curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_1" "$UPLOAD_URL?name=$ASSET_NAME_1"
+
+        # Upload asset 2
+        curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Content-Type: application/octet-stream" --data-binary @"$ASSET_NAME_2" "$UPLOAD_URL?name=$ASSET_NAME_2"

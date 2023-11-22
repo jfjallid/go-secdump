@@ -30,79 +30,105 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math/bits"
+	"strconv"
 )
 
 const (
 	WIN_UNKNOWN = iota
 	WINXP
+	WIN_SERVER_2003
+	WIN_VISTA
+	WIN_SERVER_2008
 	WIN7
+	WIN_SERVER_2008_R2
 	WIN8
+	WIN_SERVER_2012
 	WIN81
+	WIN_SERVER_2012_R2
 	WIN10
+	WIN_SERVER_2016
+	WIN_SERVER_2019
+	WIN_SERVER_2022
+	WIN11
 )
 
-func GetOSVersion(build int, version float64) (os byte, err error) {
+var osNameMap = map[byte]string{
+	WIN_UNKNOWN:        "Windows Unknown",
+	WINXP:              "Windows XP",
+	WIN_VISTA:          "Windows Vista",
+	WIN7:               "Windows 7",
+	WIN8:               "Windows 8",
+	WIN81:              "Windows 8.1",
+	WIN10:              "Windows 10",
+	WIN11:              "Windows 11",
+	WIN_SERVER_2003:    "Windows Server 2003",
+	WIN_SERVER_2008:    "Windows Server 2008",
+	WIN_SERVER_2008_R2: "Windows Server 2008 R2",
+	WIN_SERVER_2012:    "Windows Server 2012",
+	WIN_SERVER_2012_R2: "Windows Server 2012 R2",
+	WIN_SERVER_2016:    "Windows Server 2016",
+	WIN_SERVER_2019:    "Windows Server 2019",
+	WIN_SERVER_2022:    "Windows Server 2022",
+}
 
-	if (build >= 7000) && (build < 7999) {
-		log.Debugf("Windows 7\n")
-		os = WIN7
-	} else if (build >= 9000) && (build < 9999) {
-		if version < 6.3 {
-			log.Debugf("Windows 8\n")
-			os = WIN8
-		} else {
-			//log.Debugf("Windows 8.1\n")
-			os = WIN81
-		}
-	} else if (build >= 10000) && (build < 18363) {
-		log.Debugf("Windows 10\n")
-		os = WIN10
-	} else {
-		if (version < 5.2) && (version > 5.0) {
-			os = WINXP
-			log.Debugf("Windows XP?\n")
-		} else {
+func GetOSVersion(currentBuild int, currentVersion float64, server bool) (os byte) {
+
+	currentVersionStr := strconv.FormatFloat(currentVersion, 'f', 1, 64)
+	if server {
+		switch {
+		case currentBuild >= 3790 && currentBuild < 6001:
+			os = WIN_SERVER_2003
+		case currentBuild >= 6001 && currentBuild < 7601:
+			os = WIN_SERVER_2008
+		case currentBuild >= 7601 && currentBuild < 9200:
+			os = WIN_SERVER_2008_R2
+		case currentBuild >= 9200 && currentBuild < 9600:
+			os = WIN_SERVER_2012
+		case currentBuild >= 9200 && currentBuild < 14393:
+			os = WIN_SERVER_2012_R2
+		case currentBuild >= 14393 && currentBuild < 17763:
+			os = WIN_SERVER_2016
+		case currentBuild >= 17763 && currentBuild < 20348:
+			os = WIN_SERVER_2019
+		case currentBuild >= 20348:
+			os = WIN_SERVER_2022
+		default:
+			log.Debugf("Unknown server version of Windows with CurrentBuild %d and CurrentVersion %f\n", currentBuild, currentVersion)
 			os = WIN_UNKNOWN
-			log.Debugf("Unknown OS\n")
+		}
+	} else {
+		switch currentVersionStr {
+		case "5.1":
+			os = WINXP
+		case "6.0":
+			// Windows Vista but it shares CurrentVersion and CurrentBuild with Windows Server 2008
+			os = WIN_VISTA
+		case "6.1":
+			// Windows 7 but it shares CurrentVersion and CurrentBuild with Windows Server 2008 R2
+			os = WIN7
+		case "6.2":
+			// Windows 8 but it shares CurrentVersion and CurrentBuild with Windows Server 2012
+			os = WIN8
+		case "6.3":
+			// Windows 8.1 but it shares CurrentVersion and CurrentBuild with Windows Server 2012 R2
+			os = WIN81
+		case "10.0":
+			if currentBuild < 22000 {
+				os = WIN10
+			} else {
+				os = WIN11
+			}
+		default:
+			log.Debugf("Unknown version of Windows with CurrentBuild %d and CurrentVersion %f\n", currentBuild, currentVersion)
+			os = WIN_UNKNOWN
 		}
 	}
-	log.Debugf("OS Version: %d\n", os)
+
+	log.Debugf("OS Version: %s\n", osNameMap[os])
 	return
 }
 
-func GetOsVersionName(build int, version float64, inErr error) string {
-	if inErr != nil {
-		log.Errorln(inErr)
-		return "Unknown OS"
-	}
-	os, err := GetOSVersion(build, version)
-	if err != nil {
-		log.Errorln(err)
-		return "Unknown OS"
-	}
-	result := "Unknown OS"
-	switch os {
-	case WIN_UNKNOWN:
-		break
-	case WINXP:
-		result = "Windows XP"
-	case WIN7:
-		result = "Windows 7"
-	case WIN8:
-		result = "Windows 8"
-	case WIN81:
-		result = "Windows 8.1"
-	case WIN10:
-		result = "Windows 10"
-	}
-
-	return result
-}
-
-func IsWin10After1607(build int, version float64, inErr error) (value bool, err error) {
-	if inErr != nil {
-		return false, inErr
-	}
+func IsWin10After1607(build int, version float64) (value bool, err error) {
 	if build >= 14393 {
 		value = true
 	} else {
@@ -111,14 +137,8 @@ func IsWin10After1607(build int, version float64, inErr error) (value bool, err 
 	return
 }
 
-func IsBetweenWinXPWin10(build int, version float64, inErr error) (value bool, err error) {
-	if inErr != nil {
-		return false, inErr
-	}
-	os, err := GetOSVersion(build, version)
-	if err != nil {
-		return
-	}
+func IsBetweenWinXPWin10(build int, version float64, isServer bool) (value bool, err error) {
+	os := GetOSVersion(build, version, isServer)
 	if (WINXP <= os) && (os <= WIN10) {
 		value = true
 	} else {
