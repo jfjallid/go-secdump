@@ -718,15 +718,26 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 			continue
 		}
 
+		/* According to https://www.insecurity.be/blog/2018/01/21/retrieving-ntlm-hashes-and-what-changed-technical-writeup/
+		   Windows systems before build 14393 (Windows 10 anniversary update) has RC4 encrypted hashes
+		   and systems after that build have AES encrypted hashes.
+
+		   Some corner cases:
+		   - Windows systems out there that where installed pre Windows v1607: RC4 encryption only.
+		   - Windows systems that where installed as pre Windows v1607 but updated later without password updates (net user Administrator 123456): RC4 encryption only
+		   - Windows systems that where installed as pre Windows v1607 and then updated and have updated one or more user passwords (net user Administrator 123456): Mixed RC4 (SysKey) and AES (Hash) encryption
+		   - Windows systems that where installed as Windows v1607 or newer: AES encryption only
+		*/
+
 		szNT := binary.LittleEndian.Uint32(v[0xac:])
 		offsetHashStruct := binary.LittleEndian.Uint32(v[0xa8:]) + 0xcc
 		//log.Debugf("Size of SAM Hash structure for user %s: %d located at offset: 0x%x\n", name, szNT, offsetHashStruct)
-		preWin11, err2 := IsBetweenWinXPWin10(osBuild, osVersion, isServer)
-		if err2 != nil {
-			log.Errorln(err2)
-			continue
-		}
-		if preWin11 && (0x14 == szNT) {
+		//preWin11, err2 := IsBetweenWinXPWin10(osBuild, osVersion, isServer)
+		//if err2 != nil {
+		//	log.Errorln(err2)
+		//	continue
+		//}
+		if osBuild < 14393 && (0x14 == szNT) {
 			// PreWin10Anniversary update (RC4)
 			szNT -= 4                            // Hash length is reported as 20 bytes. 2+2+16 bytes for all members of the structure
 			offsetNTHash := offsetHashStruct + 4 // Skipping first 4 bytes of structure
@@ -739,7 +750,13 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 				continue
 			}
 			if afterAnniversary {
-				if 0x38 == szNT {
+				if 0x14 == szNT {
+					// System upgraded but without password updates
+					szNT -= 4                            // Hash length is reported as 20 bytes. 2+2+16 bytes for all members of the structure
+					offsetNTHash := offsetHashStruct + 4 // Skipping first 4 bytes of structure
+					result[cntr].AES = false
+					result[cntr].Data = v[offsetNTHash : offsetNTHash+16]
+				} else if 0x38 == szNT {
 					// AES Structure is 2+2+4+16+32 = 56 or 0x38 bytes for all members of the structure
 					offsetIV := offsetHashStruct + 8      // Skipping first 8 bytes of AES Hash structure
 					offsetNTHash := offsetHashStruct + 24 // The aes encrypted NT Hash begins after the 16 byte IV (8 + 16)
@@ -748,6 +765,10 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 					result[cntr].IV = v[offsetIV : offsetIV+16]
 				} else if szNT == 0x18 { // Structure with empty hashes (2+2+4+16)
 					result[cntr].AES = true
+					result[cntr].Data = []byte{}
+				} else if szNT == 0x4 { // Structure with empty hash for RC4
+					// System upgraded but without passord updates and in this case, an empty password
+					result[cntr].AES = false
 					result[cntr].Data = []byte{}
 				} else {
 					//log.Warningf("NT Hash length for %s is 0x%x when after win10 Anniversary update is: %v which is unexpected\n", name, szNT, afterAnniversary)

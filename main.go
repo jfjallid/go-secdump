@@ -39,7 +39,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.2"
+var release string = "0.1.3"
 
 func startRemoteRegistry(session *smb.Connection, share string) (err error) {
 	f, err := session.OpenFile(share, "svcctl")
