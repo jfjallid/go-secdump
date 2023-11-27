@@ -46,10 +46,13 @@ options:
   -p, --pass                Password
       --hash                Hex encoded NT Hash for user password
       --local               Authenticate as a local user instead of domain user
+      --dump                Saves the SAM and SECURITY hives to disk and
+                            transfers them to the local machine.
   -t, --timeout             Dial timeout in seconds (default 5)
       --noenc               Disable smb encryption
       --smb2                Force smb 2.1
       --debug               Enable debug logging
+      --verbose             Enable verbose logging
   -v, --version             Show version
 
 ```
