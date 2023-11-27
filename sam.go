@@ -487,7 +487,7 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 	}
 	BootKey = make([]byte, 16)
 	copy(BootKey, result)
-	log.Noticef("BootKey: 0x%x\n", BootKey)
+	log.Infof("BootKey: 0x%x\n", BootKey)
 
 	return
 }
@@ -571,7 +571,7 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte) (sysKey []byte, err error) {
 		return
 	}
 
-	log.Noticef("SysKey: 0x%x\n", sysKey)
+	log.Infof("SysKey: 0x%x\n", sysKey)
 	return
 }
 

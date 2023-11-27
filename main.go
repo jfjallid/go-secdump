@@ -41,7 +41,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.3"
+var release string = "0.1.4"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -57,7 +57,7 @@ func getRandString(n int) string {
 	return string(arr)
 }
 
-func startRemoteRegistry(session *smb.Connection, share string) (err error) {
+func startRemoteRegistry(session *smb.Connection, share string) (started, disabled bool, err error) {
 	f, err := session.OpenFile(share, "svcctl")
 	if err != nil {
 		log.Errorln(err)
@@ -77,34 +77,75 @@ func startRemoteRegistry(session *smb.Connection, share string) (err error) {
 	status, err := bind.GetServiceStatus(serviceName)
 	if err != nil {
 		log.Errorln(err)
-		return err
+		return
 	} else {
 		if status == dcerpc.ServiceRunning {
-			return nil
+			started = true
+			disabled = false
+			return
 		}
 		// Check if disabled
 		config, err := bind.GetServiceConfig(serviceName)
 		if err != nil {
 			log.Errorf("Failed to get config of %s service with error: %v\n", serviceName, err)
-			return err
+			return started, disabled, err
 		}
 		if config.StartType == dcerpc.StartTypeStatusMap[dcerpc.ServiceDisabled] {
+			disabled = true
 			// Enable service
 			err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDemandStart, dcerpc.ServiceNoChange, "", "", "")
 			if err != nil {
 				log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
-				return err
+				return started, disabled, err
 			}
 		}
 		// Start service
 		err = bind.StartService(serviceName)
 		if err != nil {
 			log.Errorln(err)
-			return err
+			return started, disabled, err
 		}
 		time.Sleep(time.Second)
 	}
-	return nil
+	return
+}
+
+func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (err error) {
+	log.Infoln("Trying to restore RemoteRegistry service status")
+	f, err := session.OpenFile(share, "svcctl")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	defer f.CloseFile()
+
+	bind, err := dcerpc.Bind(f, dcerpc.MSRPCUuidSvcCtl, dcerpc.MSRPCSvcCtlMajorVersion, dcerpc.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
+	if err != nil {
+		log.Errorln("Failed to bind to service")
+		log.Errorln(err)
+		return
+	}
+
+	serviceName := "RemoteRegistry"
+
+	// Stop service
+	err = bind.ControlService(serviceName, dcerpc.ServiceControlStop)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	log.Infoln("Service RemoteRegistry stopped")
+
+	if disable {
+		err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDisabled, dcerpc.ServiceNoChange, "", "", "")
+		if err != nil {
+			log.Errorf("Failed to change service config to Disabled with error: %v\n", err)
+			return
+		}
+		log.Infoln("Service RemoteRegistry disabled")
+	}
+
+	return
 }
 
 func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string, m map[string]*msrrp.SecurityDescriptor) (map[string]*msrrp.SecurityDescriptor, error) {
@@ -190,7 +231,7 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, m map[string]*
 }
 
 func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string, m map[string]*msrrp.SecurityDescriptor) error {
-	log.Noticeln("Attempting to restore security descriptors")
+	log.Infoln("Attempting to restore security descriptors")
 	// Rollback changes in reverse order
 	for i, j := 0, len(keys)-1; i < j; i, j = i+1, j-1 {
 		keys[i], keys[j] = keys[j], keys[i]
@@ -481,7 +522,7 @@ func dumpOnline(rpccon *msrrp.RPCCon, hKey []byte) error {
 		return err
 	}
 
-	fmt.Println("Restored permissions on ACLs")
+	log.Infoln("Restored permissions on ACLs")
 
 	return nil
 }
@@ -656,11 +697,17 @@ func main() {
 	defer session.TreeDisconnect(share)
 
 	// Check if RemoteRegistry is running, and if not, enable it
-	err = startRemoteRegistry(session, share)
+	registryStarted, registryDisabled, err := startRemoteRegistry(session, share)
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
+
+	defer func() {
+		if !registryStarted {
+			stopRemoteRegistry(session, share, registryDisabled)
+		}
+	}()
 
 	// Open connection to Windows Remote Registry pipe
 	f, err := session.OpenFile(share, msrrp.MSRRPPipe)
