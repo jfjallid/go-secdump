@@ -32,6 +32,7 @@ import (
 
 	rundebug "runtime/debug"
 
+	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 
 	"github.com/jfjallid/go-smb/smb"
@@ -41,7 +42,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.1.4"
+var release string = "0.2.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -55,6 +56,16 @@ func getRandString(n int) string {
 		arr[i] = letters[rand.Intn(len(letters))]
 	}
 	return string(arr)
+}
+
+func isFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func startRemoteRegistry(session *smb.Connection, share string) (started, disabled bool, err error) {
@@ -100,7 +111,7 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 			}
 		}
 		// Start service
-		err = bind.StartService(serviceName)
+		err = bind.StartService(serviceName, nil)
 		if err != nil {
 			log.Errorln(err)
 			return started, disabled, err
@@ -531,15 +542,23 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host                Hostname or ip address of remote server
-      -P, --port                SMB Port (default 445)
-      -d, --domain              Domain name to use for login
-      -u, --user                Username
-      -p, --pass                Password
-          --hash                Hex encoded NT Hash for user password
+          --host <target>       Hostname or ip address of remote server
+      -P, --port <port>         SMB Port (default 445)
+      -d, --domain <domain>     Domain name to use for login
+      -u, --user <username>     Username
+      -p, --pass <pass>         Password
+      -n, --no-pass             Disable password prompt and send no credentials
+          --hash <NT Hash>      Hex encoded NT Hash for user password
           --local               Authenticate as a local user instead of domain user
           --dump                Saves the SAM and SECURITY hives to disk and
                                 transfers them to the local machine.
+          --relay               Start an SMB listener that will relay incoming
+                                NTLM authentications to the remote server and
+                                use that connection. NOTE that this forces SMB 2.1
+                                without encryption.
+          --relay-port <port>   Listening port for relay (default 445)
+          --socks-host <target> Establish connection via a SOCKS5 proxy server
+          --socks-port <port>   SOCKS5 proxy port (default 1080)
       -t, --timeout             Dial timeout in seconds (default 5)
           --noenc               Disable smb encryption
           --smb2                Force smb 2.1
@@ -549,9 +568,9 @@ var helpMsg = `
 `
 
 func main() {
-	var host, username, password, hash, domain string
-	var port, dialTimeout int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose bool
+	var host, username, password, hash, domain, socksIP string
+	var port, dialTimeout, socksPort, relayPort int
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass bool
 	var err error
 
 	flag.Usage = func() {
@@ -579,6 +598,12 @@ func main() {
 	flag.IntVar(&dialTimeout, "timeout", 5, "")
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
+	flag.BoolVar(&relay, "relay", false, "")
+	flag.IntVar(&relayPort, "relay-port", 445, "")
+	flag.StringVar(&socksIP, "socks-host", "", "")
+	flag.IntVar(&socksPort, "socks-port", 1080, "")
+	flag.BoolVar(&noPass, "no-pass", false, "")
+	flag.BoolVar(&noPass, "n", false, "")
 
 	flag.Parse()
 
@@ -590,16 +615,16 @@ func main() {
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
 	} else if verbose {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetLogLevel(golog.LevelInfo)
 	} else {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelError, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 	}
 
 	if version {
@@ -623,6 +648,12 @@ func main() {
 		return
 	}
 
+	if socksIP != "" && isFlagSet("timeout") {
+		log.Errorln("When a socks proxy is specified, --timeout is not supported")
+		flag.Usage()
+		return
+	}
+
 	if dialTimeout < 1 {
 		log.Errorln("Valid value for the timeout is > 0 seconds")
 		return
@@ -637,22 +668,22 @@ func main() {
 		}
 	}
 
-	if (password == "") && (hashBytes == nil) {
-		fmt.Printf("Enter password: ")
-		passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Println()
-		if err != nil {
-			log.Errorln(err)
-			return
+	if noPass {
+		password = ""
+		hashBytes = nil
+	} else {
+		if (password == "") && (hashBytes == nil) {
+			fmt.Printf("Enter password: ")
+			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+			password = string(passBytes)
 		}
-		password = string(passBytes)
 	}
 
-	timeout, err := time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
 	options := smb.Options{
 		Host: host,
 		Port: port,
@@ -665,10 +696,34 @@ func main() {
 		},
 		DisableEncryption: noEnc,
 		ForceSMB2:         forceSMB2,
-		DialTimeout:       timeout,
 	}
 
-	session, err := smb.NewConnection(options)
+	// Only if not using SOCKS
+	if socksIP == "" {
+		options.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+	}
+
+	var session *smb.Connection
+
+	if socksIP != "" {
+		dialSocksProxy, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", socksIP, socksPort), nil, proxy.Direct)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		options.ProxyDialer = dialSocksProxy
+	}
+
+	if relay {
+		options.RelayPort = relayPort
+		session, err = smb.NewRelayConnection(options)
+	} else {
+		session, err = smb.NewConnection(options)
+	}
 	if err != nil {
 		log.Criticalln(err)
 		return
@@ -682,9 +737,10 @@ func main() {
 	}
 
 	if session.IsAuthenticated {
-		log.Noticeln("[+] Login successful")
+		log.Noticef("[+] Login successful as %s\n", session.GetAuthUsername())
 	} else {
 		log.Noticeln("[-] Login failed")
+		return
 	}
 
 	// Connect to IPC$ share
