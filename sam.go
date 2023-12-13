@@ -56,7 +56,7 @@ type UserCreds struct {
 	AES      bool
 }
 
-type printableSecret struct {
+type printableLSASecret struct {
 	secretType  string
 	secrets     []string
 	extraSecret string
@@ -255,7 +255,7 @@ func getServiceUser(rpccon *msrrp.RPCCon, base []byte, name string) (result stri
 	return rpccon.QueryValueString(hSubKey, "ObjectName")
 }
 
-func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []byte) (result *printableSecret, err error) {
+func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []byte) (result *printableLSASecret, err error) {
 
 	if len(secretItem) == 0 {
 		log.Debugf("Discarding secret %s, NULL Data\n", name)
@@ -268,7 +268,7 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 	secret := ""
 	extrasecret := ""
 	upperName := strings.ToUpper(name)
-	result = &printableSecret{}
+	result = &printableLSASecret{}
 	result.secretType = "[*] " + name
 	if strings.HasPrefix(upperName, "_SC_") {
 		secretDecoded, err2 := encoder.FromUnicodeString(secretItem)
@@ -329,7 +329,7 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		h := md4.New()
 		h.Write(secretItem)
 		printname := "$MACHINE.ACC"
-		secret = fmt.Sprintf("$MACHINE.ACC: %s", h.Sum(nil))
+		secret = fmt.Sprintf("$MACHINE.ACC: 0x%x", h.Sum(nil))
 		result.secrets = append(result.secrets, secret)
 		// Always print plaintext anyway since this may be needed for some popular usecases
 		extrasecret = fmt.Sprintf("%s:plain_password_hex:%x", printname, secretItem)
@@ -731,12 +731,9 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 
 		szNT := binary.LittleEndian.Uint32(v[0xac:])
 		offsetHashStruct := binary.LittleEndian.Uint32(v[0xa8:]) + 0xcc
-		//log.Debugf("Size of SAM Hash structure for user %s: %d located at offset: 0x%x\n", name, szNT, offsetHashStruct)
-		//preWin11, err2 := IsBetweenWinXPWin10(osBuild, osVersion, isServer)
-		//if err2 != nil {
-		//	log.Errorln(err2)
-		//	continue
-		//}
+		if szNT == 0 {
+			continue
+		}
 		if osBuild < 14393 && (0x14 == szNT) {
 			// PreWin10Anniversary update (RC4)
 			szNT -= 4                            // Hash length is reported as 20 bytes. 2+2+16 bytes for all members of the structure
@@ -909,7 +906,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err erro
 }
 
 // Code inspired/partially stolen from Impacket's Secretsdump
-func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []printableSecret, err error) {
+func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []printableLSASecret, err error) {
 	secretsPath := `SECURITY\Policy\Secrets`
 	keys, err := rpccon.GetSubKeyNames(base, secretsPath)
 	if err != nil {
