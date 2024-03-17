@@ -45,7 +45,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.2.1"
+var release string = "0.2.2"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -163,7 +163,7 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 		if config.StartType == dcerpc.StartTypeStatusMap[dcerpc.ServiceDisabled] {
 			disabled = true
 			// Enable service
-			err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDemandStart, dcerpc.ServiceNoChange, "", "", "")
+			err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDemandStart, dcerpc.ServiceNoChange, "", "", "", "")
 			if err != nil {
 				log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
 				return started, disabled, err
@@ -207,7 +207,7 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	log.Infoln("Service RemoteRegistry stopped")
 
 	if disable {
-		err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDisabled, dcerpc.ServiceNoChange, "", "", "")
+		err = bind.ChangeServiceConfig(serviceName, dcerpc.ServiceNoChange, dcerpc.ServiceDisabled, dcerpc.ServiceNoChange, "", "", "", "")
 		if err != nil {
 			log.Errorf("Failed to change service config to Disabled with error: %v\n", err)
 			return
@@ -240,7 +240,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 			log.Errorln(err)
 			return err
 		}
-		sdBytes, err := sd.MarshalBinary(nil)
+		sdBytes, err := sd.MarshalBinary()
 		if err != nil {
 			log.Errorln(err)
 			return err
@@ -252,7 +252,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 			Sacl:     &msrrp.PACL{},
 			Dacl:     &msrrp.PACL{},
 		}
-		err = sd2.UnmarshalBinary(sdBytes, nil)
+		err = sd2.UnmarshalBinary(sdBytes)
 		if err != nil {
 			log.Errorln(err)
 			return err
@@ -370,7 +370,7 @@ func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
 			log.Errorf("Failed to hex decode security descriptor bytes with error: %s\n", err)
 			return err
 		}
-		err = sd.UnmarshalBinary(sdBytes, nil)
+		err = sd.UnmarshalBinary(sdBytes)
 		if err != nil {
 			log.Errorf("Failed to unmarshal security descriptor bytes with error: %s\n", err)
 			return err
@@ -807,6 +807,7 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelInfo)
 	} else {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
@@ -956,13 +957,13 @@ func main() {
 	}
 	defer session.Close()
 
-	if session.IsSigningRequired.Load() {
+	if session.IsSigningRequired() {
 		log.Noticeln("[-] Signing is required")
 	} else {
 		log.Noticeln("[+] Signing is NOT required")
 	}
 
-	if session.IsAuthenticated {
+	if session.IsAuthenticated() {
 		log.Noticef("[+] Login successful as %s\n", session.GetAuthUsername())
 	} else {
 		log.Noticeln("[-] Login failed")

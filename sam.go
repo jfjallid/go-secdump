@@ -389,12 +389,7 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 		return
 	}
 	rpccon.CloseKeyHandle(hSubKey)
-	hexString, err := encoder.FromUnicodeString(encoder.Utf16ToUtf8(keyinfo.ClassName))
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	jd, err := hex.DecodeString(hexString)
+	jd, err := hex.DecodeString(keyinfo.ClassName)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -415,12 +410,7 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 		return
 	}
 	rpccon.CloseKeyHandle(hSubKey)
-	hexString, err = encoder.FromUnicodeString(encoder.Utf16ToUtf8(keyinfo.ClassName))
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	skew1, err := hex.DecodeString(hexString)
+	skew1, err := hex.DecodeString(keyinfo.ClassName)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -441,12 +431,7 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 		return
 	}
 	rpccon.CloseKeyHandle(hSubKey)
-	hexString, err = encoder.FromUnicodeString(encoder.Utf16ToUtf8(keyinfo.ClassName))
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	gbg, err := hex.DecodeString(hexString)
+	gbg, err := hex.DecodeString(keyinfo.ClassName)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -467,12 +452,7 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 		return
 	}
 	rpccon.CloseKeyHandle(hSubKey)
-	hexString, err = encoder.FromUnicodeString(encoder.Utf16ToUtf8(keyinfo.ClassName))
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-	data, err := hex.DecodeString(hexString)
+	data, err := hex.DecodeString(keyinfo.ClassName)
 	if err != nil {
 		log.Errorln(err)
 		return
