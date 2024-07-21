@@ -41,11 +41,12 @@ import (
 	"github.com/jfjallid/go-smb/smb/dcerpc"
 	"github.com/jfjallid/go-smb/smb/dcerpc/msrrp"
 	"github.com/jfjallid/go-smb/smb/encoder"
+	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.2.2"
+var release string = "0.3.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -715,7 +716,7 @@ var helpMsg = `
     Usage: ` + os.Args[0] + ` [options]
 
     options:
-          --host <target>       Hostname or ip address of remote server
+          --host <target>       Hostname or ip address of remote server. Must be hostname when using Kerberos
       -P, --port <port>         SMB Port (default 445)
       -d, --domain <domain>     Domain name to use for login
       -u, --user <username>     Username
@@ -723,6 +724,10 @@ var helpMsg = `
       -n, --no-pass             Disable password prompt and send no credentials
           --hash <NT Hash>      Hex encoded NT Hash for user password
           --local               Authenticate as a local user instead of domain user
+      -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+          --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
+          --target-ip           Optionally specify ip of target when using Kerberos authentication
+          --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
           --dump                Saves the SAM and SECURITY hives to disk and
                                 transfers them to the local machine.
           --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
@@ -748,9 +753,9 @@ var helpMsg = `
 `
 
 func main() {
-	var host, username, password, hash, domain, socksIP, backupFilename, outputFilename string
+	var host, username, password, hash, domain, socksIP, backupFilename, outputFilename, targetIP, dcIP, aesKey string
 	var port, dialTimeout, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, backupDacl, restoreDacl bool
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, backupDacl, restoreDacl, kerberos bool
 	var err error
 
 	flag.Usage = func() {
@@ -792,28 +797,39 @@ func main() {
 	flag.StringVar(&backupFilename, "backup-file", "dacl.backup", "")
 	flag.StringVar(&outputFilename, "o", "", "")
 	flag.StringVar(&outputFilename, "output", "", "")
+	flag.BoolVar(&kerberos, "k", false, "")
+	flag.BoolVar(&kerberos, "kerberos", false, "")
+	flag.StringVar(&targetIP, "target-ip", "", "")
+	flag.StringVar(&dcIP, "dc-ip", "", "")
+	flag.StringVar(&aesKey, "aes-key", "", "")
 
 	flag.Parse()
 
 	if debug {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
 	} else if verbose {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelInfo)
 	} else {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 	}
 
 	if version {
@@ -868,11 +884,17 @@ func main() {
 
 	share := ""
 	var hashBytes []byte
+	var aesKeyBytes []byte
 
-	if host == "" {
-		log.Errorln("Must specify a hostname")
+	if host == "" && targetIP == "" {
+		log.Errorln("Must specify a hostname or ip")
 		flag.Usage()
 		return
+	}
+	if host != "" && targetIP == "" {
+		targetIP = host
+	} else if host == "" && targetIP != "" {
+		host = targetIP
 	}
 
 	if socksIP != "" && isFlagSet("timeout") {
@@ -895,11 +917,25 @@ func main() {
 		}
 	}
 
+	if aesKey != "" {
+		aesKeyBytes, err = hex.DecodeString(aesKey)
+		if err != nil {
+			fmt.Println("Failed to decode aesKey")
+			log.Errorln(err)
+			return
+		}
+		if len(aesKeyBytes) != 16 && len(aesKeyBytes) != 32 {
+			fmt.Println("Invalid keysize of AES Key")
+			return
+		}
+	}
+
 	if noPass {
 		password = ""
 		hashBytes = nil
+		aesKeyBytes = nil
 	} else {
-		if (password == "") && (hashBytes == nil) {
+		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) {
 			fmt.Printf("Enter password: ")
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Println()
@@ -911,23 +947,37 @@ func main() {
 		}
 	}
 
-	options := smb.Options{
-		Host: host,
-		Port: port,
-		Initiator: &smb.NTLMInitiator{
+	smbOptions := smb.Options{
+		Host:              targetIP,
+		Port:              port,
+		DisableEncryption: noEnc,
+		ForceSMB2:         forceSMB2,
+		//DisableSigning: true,
+	}
+
+	if kerberos {
+		smbOptions.Initiator = &spnego.KRB5Initiator{
+			User:     username,
+			Password: password,
+			Domain:   domain,
+			Hash:     hashBytes,
+			AESKey:   aesKeyBytes,
+			SPN:      "cifs/" + host,
+			DCIP:     dcIP,
+		}
+	} else {
+		smbOptions.Initiator = &spnego.NTLMInitiator{
 			User:      username,
 			Password:  password,
 			Hash:      hashBytes,
 			Domain:    domain,
 			LocalUser: localUser,
-		},
-		DisableEncryption: noEnc,
-		ForceSMB2:         forceSMB2,
+		}
 	}
 
 	// Only if not using SOCKS
 	if socksIP == "" {
-		options.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
+		smbOptions.DialTimeout, err = time.ParseDuration(fmt.Sprintf("%ds", dialTimeout))
 		if err != nil {
 			log.Errorln(err)
 			return
@@ -942,14 +992,14 @@ func main() {
 			log.Errorln(err)
 			return
 		}
-		options.ProxyDialer = dialSocksProxy
+		smbOptions.ProxyDialer = dialSocksProxy
 	}
 
 	if relay {
-		options.RelayPort = relayPort
-		session, err = smb.NewRelayConnection(options)
+		smbOptions.RelayPort = relayPort
+		session, err = smb.NewRelayConnection(smbOptions)
 	} else {
-		session, err = smb.NewConnection(options)
+		session, err = smb.NewConnection(smbOptions)
 	}
 	if err != nil {
 		log.Criticalln(err)

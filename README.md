@@ -39,7 +39,7 @@ https://social.technet.microsoft.com/Forums/en-US/6e3c4486-f3a1-4d4e-9f5c-bdacdb
 Usage: ./go-secdump [options]
 
 options:
-      --host <target>       Hostname or ip address of remote server
+      --host <target>       Hostname or ip address of remote server. Must be hostname when using Kerberos
   -P, --port <port>         SMB Port (default 445)
   -d, --domain <domain>     Domain name to use for login
   -u, --user <username>     Username
@@ -47,6 +47,10 @@ options:
   -n, --no-pass             Disable password prompt and send no credentials
       --hash <NT Hash>      Hex encoded NT Hash for user password
       --local               Authenticate as a local user instead of domain user
+  -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+      --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
+      --target-ip           Optionally specify ip of target when using Kerberos authentication
+      --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
       --dump                Saves the SAM and SECURITY hives to disk and
                             transfers them to the local machine.
       --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
