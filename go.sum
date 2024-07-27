@@ -1,5 +1,5 @@
-github.com/jfjallid/go-smb v0.5.2 h1:TXiFxuCEzcDHNkG6jEUewNgIoZcS0ZnkXLhydJjpO+A=
-github.com/jfjallid/go-smb v0.5.2/go.mod h1:gCorMd5NXhyMR3f1/x+qTZRSN35/6iY5TuqFIWb+Ovg=
+github.com/jfjallid/go-smb v0.5.5 h1:oY7MGmmziH0HzeUBF9sPNZOBjoWHwGON1sCazGJVAhU=
+github.com/jfjallid/go-smb v0.5.5/go.mod h1:gCorMd5NXhyMR3f1/x+qTZRSN35/6iY5TuqFIWb+Ovg=
 github.com/jfjallid/gofork v1.7.6 h1:OYyS2HH597860gkDxxjNsl+NZRxoAnuRI6ZsP++kYKE=
 github.com/jfjallid/gofork v1.7.6/go.mod h1:r1EH4W9KY5iqtiGhAupnbzMRONsLDApdJ9EZH5NWFSc=
 github.com/jfjallid/gokrb5/v8 v8.4.4 h1:log4i4lIQDOKe/RHWTHdTGeeJTYMW/+M07JgHAiE0as=

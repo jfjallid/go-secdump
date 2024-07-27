@@ -46,7 +46,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.3.0"
+var release string = "0.3.1"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
