@@ -1,6 +1,6 @@
 module github.com/jfjallid/go-secdump
 
-go 1.19
+go 1.21
 
 require (
 	github.com/jfjallid/go-smb v0.5.7
