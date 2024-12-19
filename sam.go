@@ -329,8 +329,22 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		h := md4.New()
 		h.Write(secretItem)
 		printname := "$MACHINE.ACC"
-		secret = fmt.Sprintf("$MACHINE.ACC: 0x%x", h.Sum(nil))
+		secret = fmt.Sprintf("$MACHINE.ACC (NT Hash): %x", h.Sum(nil))
 		result.secrets = append(result.secrets, secret)
+		// Calculate AES128 and AES256 keys from plaintext passwords
+		hostname, domain, err := getHostnameAndDomain(rpccon, base)
+		if err != nil {
+			log.Errorln(err)
+			// Skip calculation of AES Keys if request failed or if domain is empty
+		} else if domain != "" {
+			aes128Key, aes256Key, err := CalcMachineAESKeys(hostname, domain, secretItem)
+			if err != nil {
+				log.Errorln(err)
+			} else {
+				result.secrets = append(result.secrets, fmt.Sprintf("%s:AES_128_key:%x", printname, aes128Key))
+				result.secrets = append(result.secrets, fmt.Sprintf("%s:AES_256_key:%x", printname, aes256Key))
+			}
+		}
 		// Always print plaintext anyway since this may be needed for some popular usecases
 		extrasecret = fmt.Sprintf("%s:plain_password_hex:%x", printname, secretItem)
 		result.extraSecret = extrasecret
@@ -1186,5 +1200,29 @@ func GetOSVersionBuild(rpccon *msrrp.RPCCon, base []byte) (build int, version fl
 		server = true
 	}
 
+	return
+}
+
+func getHostnameAndDomain(rpccon *msrrp.RPCCon, base []byte) (hostname, domain string, err error) {
+	hSubKey, err := rpccon.OpenSubKey(base, `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`)
+	if err != nil {
+		log.Noticef("Failed to open registry key Parameters with error: %v\n", err)
+		return
+	}
+	defer func(h []byte) {
+		rpccon.CloseKeyHandle(h)
+	}(hSubKey)
+
+	domain, err = rpccon.QueryValueString(hSubKey, "Domain")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+
+	hostname, err = rpccon.QueryValueString(hSubKey, "Hostname")
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
 	return
 }

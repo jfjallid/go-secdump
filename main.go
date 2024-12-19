@@ -46,7 +46,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.3.1"
+var release string = "0.4.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -928,6 +928,11 @@ func main() {
 			fmt.Println("Invalid keysize of AES Key")
 			return
 		}
+	}
+
+	if aesKey != "" && !kerberos {
+		fmt.Println("Must use Kerberos auth (-k) when using --aes-key")
+		flag.Usage()
 	}
 
 	if noPass {
