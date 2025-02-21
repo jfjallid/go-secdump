@@ -20,6 +20,13 @@ administrators had the WriteDACL permission on the registry hives and could
 thus be used to temporarily grant read access to itself to retrieve the
 secrets and then restore the original permissions.
 
+However, a better approach was discovered (February 2025) by Julien Egloff
+over at Synacktiv. The BaseRegOpenKey request used to open handles to registry
+keys has an option to assert the SeBackupPrivilege which allows us to open the
+registry keys without first changing the DACLs.
+The tool has been updated to prefer this new approach and only change the DACLs
+if asked nicely.
+
 ## Credits
 Much of the code in this project is inspired/taken from Impacket's secdump
 but converted to access the Windows registry remotely and to only access the
@@ -33,6 +40,9 @@ https://www.passcape.com/index.php?section=docsys&cmd=details&id=23
 http://www.beginningtoseethelight.org/ntsecurity/index.htm
 
 https://social.technet.microsoft.com/Forums/en-US/6e3c4486-f3a1-4d4e-9f5c-bdacdb245cfd/how-are-ntlm-hashes-stored-under-the-v-key-in-the-sam?forum=win10itprogeneral
+
+The idea to use SeBackupPrivilege came from Synacktiv:
+https://www.synacktiv.com/publications/lsa-secrets-revisiting-secretsdump
 
 ## Usage
 ```
@@ -56,6 +66,8 @@ options:
       --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
       --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
       --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
+      --modify-dacl         Change DACLs of reg keys before dump.
+                            Only required if keys cannot be opened using SeBackupPrivilege. (default false)
       --backup-dacl         Save original DACLs to disk before modification
       --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
       --backup-file         Filename for DACL backup (default dacl.backup)
@@ -73,9 +85,11 @@ options:
       --verbose             Enable verbose logging
   -o, --output              Filename for writing results (default is stdout). Will append to file if it exists.
   -v, --version             Show version
+
 ```
 
 ## Changing DACLs
+Now only as an optional feature enabled with `--modify-dacl`,
 go-secdump will automatically try to modify and then restore the DACLs of the
 required registry keys. However, if something goes wrong during the restoration
 part such as a network disconnect or other interrupt, the remote registry will
@@ -88,7 +102,7 @@ using the `--restore-dacl` argument.
 
 ## Examples
 
-Dump all registry secrets
+Dump all registry secrets using the SeBackupPrivilege trick
 
 ```
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local

