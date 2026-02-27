@@ -33,7 +33,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jfjallid/go-smb/smb/dcerpc/msrrp"
+	"github.com/jfjallid/go-smb/dcerpc/msrrp"
 	"github.com/jfjallid/go-smb/smb/encoder"
 	"golang.org/x/crypto/md4"
 )
@@ -63,7 +63,7 @@ type printableLSASecret struct {
 }
 
 // https://www.passcape.com/index.php?section=docsys&cmd=details&id=23
-type lsa_secret struct {
+type lsaSecret struct {
 	Version       uint32
 	EncKeyId      string // 16 bytes
 	EncAlgorithm  uint32
@@ -71,36 +71,36 @@ type lsa_secret struct {
 	EncryptedData []byte
 }
 
-func (self *lsa_secret) unmarshal(data []byte) {
-	self.Version = binary.LittleEndian.Uint32(data[:4])
-	self.EncKeyId = string(data[4:20])
-	self.EncAlgorithm = binary.LittleEndian.Uint32(data[20:24])
-	self.Flags = binary.LittleEndian.Uint32(data[24:28])
-	self.EncryptedData = data[28:]
+func (s *lsaSecret) unmarshal(data []byte) {
+	s.Version = binary.LittleEndian.Uint32(data[:4])
+	s.EncKeyId = string(data[4:20])
+	s.EncAlgorithm = binary.LittleEndian.Uint32(data[20:24])
+	s.Flags = binary.LittleEndian.Uint32(data[24:28])
+	s.EncryptedData = data[28:]
 }
 
-type lsa_secret_blob struct {
+type lsaSecretBlob struct {
 	Length  uint32
 	Unknown [12]byte
 	Secret  []byte
 }
 
-func (self *lsa_secret_blob) unmarshal(data []byte) {
-	self.Length = binary.LittleEndian.Uint32(data[:4])
-	copy(self.Unknown[:], data[4:16])
-	self.Secret = data[16 : 16+self.Length]
+func (s *lsaSecretBlob) unmarshal(data []byte) {
+	s.Length = binary.LittleEndian.Uint32(data[:4])
+	copy(s.Unknown[:], data[4:16])
+	s.Secret = data[16 : 16+s.Length]
 }
 
-type dpapi_system struct {
+type dpapiSystem struct {
 	Version    uint32
 	MachineKey [20]byte
 	UserKey    [20]byte
 }
 
-func (self *dpapi_system) unmarshal(data []byte) {
-	self.Version = binary.LittleEndian.Uint32(data[:4])
-	copy(self.MachineKey[:], data[4:24])
-	copy(self.UserKey[:], data[24:44])
+func (d *dpapiSystem) unmarshal(data []byte) {
+	d.Version = binary.LittleEndian.Uint32(data[:4])
+	copy(d.MachineKey[:], data[4:24])
+	copy(d.UserKey[:], data[24:44])
 }
 
 type sam_key_data_aes struct {
@@ -146,33 +146,33 @@ type domain_account_f struct { // 104 bytes of fixed length fields
 	Data                         []byte
 }
 
-func (self *domain_account_f) unmarshal(data []byte) (err error) {
+func (f *domain_account_f) unmarshal(data []byte) (err error) {
 	if len(data) < 104 {
 		err = fmt.Errorf("Not enough data to unmarshal a DOMAIN_ACCOUNT_F")
 		log.Errorln(err)
 		return
 	}
 
-	self.Revision = binary.LittleEndian.Uint16(data[:2])
-	self.CreationTime = binary.LittleEndian.Uint64(data[8:16])
-	self.DomainModifiedAccount = binary.LittleEndian.Uint64(data[16:24])
-	self.MaxPasswordAge = binary.LittleEndian.Uint64(data[24:32])
-	self.MinPasswordAge = binary.LittleEndian.Uint64(data[32:40])
-	self.ForceLogoff = binary.LittleEndian.Uint64(data[40:48])
-	self.LockoutDuration = binary.LittleEndian.Uint64(data[48:56])
-	self.LockoutObservationWindow = binary.LittleEndian.Uint64(data[56:64])
-	self.ModifiedCountAtLastPromotion = binary.LittleEndian.Uint64(data[64:72])
-	self.NextRid = binary.LittleEndian.Uint32(data[72:76])
-	self.PasswordProperties = binary.LittleEndian.Uint32(data[76:80])
-	self.MinPasswordLength = binary.LittleEndian.Uint16(data[80:82])
-	self.PasswordHistoryLength = binary.LittleEndian.Uint16(data[82:84])
-	self.LockoutThreshold = binary.LittleEndian.Uint16(data[84:86])
-	self.ServerState = binary.LittleEndian.Uint32(data[88:92])
-	self.ServerRole = binary.LittleEndian.Uint32(data[92:96])
-	self.UasCompatibilityRequired = binary.LittleEndian.Uint32(data[96:100])
+	f.Revision = binary.LittleEndian.Uint16(data[:2])
+	f.CreationTime = binary.LittleEndian.Uint64(data[8:16])
+	f.DomainModifiedAccount = binary.LittleEndian.Uint64(data[16:24])
+	f.MaxPasswordAge = binary.LittleEndian.Uint64(data[24:32])
+	f.MinPasswordAge = binary.LittleEndian.Uint64(data[32:40])
+	f.ForceLogoff = binary.LittleEndian.Uint64(data[40:48])
+	f.LockoutDuration = binary.LittleEndian.Uint64(data[48:56])
+	f.LockoutObservationWindow = binary.LittleEndian.Uint64(data[56:64])
+	f.ModifiedCountAtLastPromotion = binary.LittleEndian.Uint64(data[64:72])
+	f.NextRid = binary.LittleEndian.Uint32(data[72:76])
+	f.PasswordProperties = binary.LittleEndian.Uint32(data[76:80])
+	f.MinPasswordLength = binary.LittleEndian.Uint16(data[80:82])
+	f.PasswordHistoryLength = binary.LittleEndian.Uint16(data[82:84])
+	f.LockoutThreshold = binary.LittleEndian.Uint16(data[84:86])
+	f.ServerState = binary.LittleEndian.Uint32(data[88:92])
+	f.ServerRole = binary.LittleEndian.Uint32(data[92:96])
+	f.UasCompatibilityRequired = binary.LittleEndian.Uint32(data[96:100])
 	if len(data) > 104 {
-		self.Data = make([]byte, len(data[104:]))
-		copy(self.Data, data[104:])
+		f.Data = make([]byte, len(data[104:]))
+		copy(f.Data, data[104:])
 	}
 	return
 }
@@ -204,43 +204,43 @@ type nl_record struct {
 	EncryptedData            []byte
 }
 
-func (self *nl_record) unmarshal(data []byte) (err error) {
+func (r *nl_record) unmarshal(data []byte) (err error) {
 	if len(data) < 96 {
 		err = fmt.Errorf("Not enough data to unmarshal an NL_RECORD")
 		log.Errorln(err)
 		return
 	}
 
-	self.UserLength = binary.LittleEndian.Uint16(data[:2])
-	self.DomainNameLength = binary.LittleEndian.Uint16(data[2:4])
-	self.EffectiveNameLength = binary.LittleEndian.Uint16(data[4:6])
-	self.FullNameLength = binary.LittleEndian.Uint16(data[6:8])
-	self.LogonScriptName = binary.LittleEndian.Uint16(data[8:10])
-	self.ProfilePathLength = binary.LittleEndian.Uint16(data[10:12])
-	self.HomeDirectoryLength = binary.LittleEndian.Uint16(data[12:14])
-	self.HomeDirectoryDriveLength = binary.LittleEndian.Uint16(data[14:16])
-	self.UserId = binary.LittleEndian.Uint32(data[16:20])
-	self.PrimaryGroupId = binary.LittleEndian.Uint32(data[20:24])
-	self.GroupCount = binary.LittleEndian.Uint32(data[24:28])
-	self.logonDomainNameLength = binary.LittleEndian.Uint16(data[28:30])
-	self.Unk0 = binary.LittleEndian.Uint16(data[30:32])
-	self.LastWrite = binary.LittleEndian.Uint64(data[32:40])
-	self.Revision = binary.LittleEndian.Uint32(data[40:44])
-	self.SidCount = binary.LittleEndian.Uint32(data[44:48])
-	self.Flags = binary.LittleEndian.Uint32(data[48:52])
-	self.Unk1 = binary.LittleEndian.Uint32(data[52:56])
-	self.LogonPackageLength = binary.LittleEndian.Uint32(data[56:60])
-	self.DnsDomainNameLength = binary.LittleEndian.Uint16(data[60:62])
-	self.UPN = binary.LittleEndian.Uint16(data[62:64])
-	copy(self.IV[:], data[64:80])
-	copy(self.CH[:], data[80:96])
-	self.EncryptedData = data[96:]
+	r.UserLength = binary.LittleEndian.Uint16(data[:2])
+	r.DomainNameLength = binary.LittleEndian.Uint16(data[2:4])
+	r.EffectiveNameLength = binary.LittleEndian.Uint16(data[4:6])
+	r.FullNameLength = binary.LittleEndian.Uint16(data[6:8])
+	r.LogonScriptName = binary.LittleEndian.Uint16(data[8:10])
+	r.ProfilePathLength = binary.LittleEndian.Uint16(data[10:12])
+	r.HomeDirectoryLength = binary.LittleEndian.Uint16(data[12:14])
+	r.HomeDirectoryDriveLength = binary.LittleEndian.Uint16(data[14:16])
+	r.UserId = binary.LittleEndian.Uint32(data[16:20])
+	r.PrimaryGroupId = binary.LittleEndian.Uint32(data[20:24])
+	r.GroupCount = binary.LittleEndian.Uint32(data[24:28])
+	r.logonDomainNameLength = binary.LittleEndian.Uint16(data[28:30])
+	r.Unk0 = binary.LittleEndian.Uint16(data[30:32])
+	r.LastWrite = binary.LittleEndian.Uint64(data[32:40])
+	r.Revision = binary.LittleEndian.Uint32(data[40:44])
+	r.SidCount = binary.LittleEndian.Uint32(data[44:48])
+	r.Flags = binary.LittleEndian.Uint32(data[48:52])
+	r.Unk1 = binary.LittleEndian.Uint32(data[52:56])
+	r.LogonPackageLength = binary.LittleEndian.Uint32(data[56:60])
+	r.DnsDomainNameLength = binary.LittleEndian.Uint16(data[60:62])
+	r.UPN = binary.LittleEndian.Uint16(data[62:64])
+	copy(r.IV[:], data[64:80])
+	copy(r.CH[:], data[80:96])
+	r.EncryptedData = data[96:]
 	return
 }
 
 func pad64(data uint64) uint64 {
 	if (data & 0x3) > 0 {
-		return data + (data & 0x3)
+		return data + (4 - (data & 0x3))
 	}
 	return data
 }
@@ -261,7 +261,7 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		log.Debugf("Discarding secret %s, NULL Data\n", name)
 		return
 	}
-	if bytes.Compare(secretItem[:2], []byte{0, 0}) == 0 {
+	if bytes.Equal(secretItem[:2], []byte{0, 0}) {
 		log.Debugf("Discarding secret %s, all zeros\n", name)
 		return
 	}
@@ -317,7 +317,7 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		secret = fmt.Sprintf("ASPNET: %s", secretDecoded)
 		result.secrets = append(result.secrets, secret)
 	} else if strings.HasPrefix(upperName, "DPAPI_SYSTEM") {
-		dpapi := &dpapi_system{}
+		dpapi := &dpapiSystem{}
 		dpapi.unmarshal(secretItem)
 		secret = fmt.Sprintf("dpapi_machinekey: 0x%x", dpapi.MachineKey)
 		secret2 := fmt.Sprintf("dpapi_userkey: 0x%x", dpapi.UserKey)
@@ -516,7 +516,6 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 	err = f.unmarshal(fBytes)
 	if err != nil {
 		log.Errorln(err)
-		rpccon.CloseKeyHandle(hSubKey)
 		return
 	}
 
@@ -530,7 +529,6 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 		err = binary.Read(bytes.NewReader(f.Data), binary.LittleEndian, &samAesData)
 		if err != nil {
 			log.Errorln(err)
-			rpccon.CloseKeyHandle(hSubKey)
 			return
 		}
 		sysKeyIV = samAesData.Salt[:]
@@ -543,7 +541,6 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 		err = binary.Read(bytes.NewReader(f.Data), binary.LittleEndian, samData)
 		if err != nil {
 			log.Errorln(err)
-			rpccon.CloseKeyHandle(hSubKey)
 			return
 		}
 
@@ -558,7 +555,7 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 		input = append(input, tmpSysKey[:16]...)
 		input = append(input, s1...)
 		checksum := md5.Sum(input)
-		if bytes.Compare(checksum[:], tmpSysKey[16:]) != 0 {
+		if !bytes.Equal(checksum[:], tmpSysKey[16:]) {
 			err = fmt.Errorf("Syskey checksum failed. Could be that a Syskey startup password is in use.")
 			log.Errorln(err)
 			return
@@ -797,7 +794,7 @@ func decryptLSAKey(rpccon *msrrp.RPCCon, base []byte, data []byte) (result []byt
 	var plaintext []byte
 	if VistaStyle {
 		// data contains a list of LSA Keys, so could be more than 1 in the list.
-		lsaSecret := &lsa_secret{}
+		lsaSecret := &lsaSecret{}
 		lsaSecret.unmarshal(data)
 		log.Debugf("LSA EncKeyId: %x, EncAlgorithm: %d\n", lsaSecret.EncKeyId, lsaSecret.EncAlgorithm)
 		encryptedData := lsaSecret.EncryptedData
@@ -808,7 +805,7 @@ func decryptLSAKey(rpccon *msrrp.RPCCon, base []byte, data []byte) (result []byt
 			err = err2
 			return
 		}
-		lsaSecretBlob := &lsa_secret_blob{}
+		lsaSecretBlob := &lsaSecretBlob{}
 		lsaSecretBlob.unmarshal(plaintext)
 		result = lsaSecretBlob.Secret[52:][:32]
 	} else {
@@ -864,7 +861,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 		hSubKey, err = rpccon.OpenSubKeyExt(base, `Security\Policy\PolEKList`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
 	}
 	if err != nil {
-		if err == fmt.Errorf("ERROR_FILE_NOT_FOUND") {
+		if err == msrrp.ReturnCodeMap[msrrp.ErrorFileNotFound] {
 			VistaStyle = false
 		} else {
 			log.Errorln(err)
@@ -886,7 +883,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			hSubKey, err = rpccon.OpenSubKeyExt(base, `Security\Policy\PolSecretEncryptionKey`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
 		}
 		if err != nil {
-			if err == fmt.Errorf("ERROR_FILE_NOT_FOUND") {
+			if err == msrrp.ReturnCodeMap[msrrp.ErrorFileNotFound] {
 				log.Infoln("Could not find LSA Secret key")
 			} else {
 				log.Errorln(err)
@@ -981,7 +978,7 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) 
 
 			if (len(value) != 0) && (value[0] == 0x0) {
 				if VistaStyle {
-					record := &lsa_secret{}
+					record := &lsaSecret{}
 					record.unmarshal(value)
 					tmpKey := SHA256(LSAKey, record.EncryptedData[:32], 0)
 					plainText, err := DecryptAES(tmpKey, record.EncryptedData[32:], nil)
@@ -989,7 +986,7 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) 
 						log.Errorln(err)
 						continue
 					}
-					record2 := &lsa_secret_blob{}
+					record2 := &lsaSecretBlob{}
 					record2.unmarshal(plainText)
 					secret = record2.Secret
 				} else {
@@ -1039,7 +1036,7 @@ func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (resul
 	rpccon.CloseKeyHandle(hSubKey)
 
 	if VistaStyle {
-		lsaSecret := &lsa_secret{}
+		lsaSecret := &lsaSecret{}
 		lsaSecret.unmarshal(data)
 		tmpkey := SHA256(LSAKey, lsaSecret.EncryptedData[:32], 0)
 		var err2 error
@@ -1140,7 +1137,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 		nilIV := make([]byte, 16)
 		var plaintext []byte
 		var answer string
-		if bytes.Compare(nl_record.IV[:], nilIV) != 0 {
+		if !bytes.Equal(nl_record.IV[:], nilIV) {
 			if (nl_record.Flags & 1) == 1 {
 				// Encrypted
 				if VistaStyle {
@@ -1178,7 +1175,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			}
 			result = append(result, answer)
 		} else {
-			//golog.Debugf("Unhandled case with NIL IV and likely empty cache record for DCC2Cache %s\n", name)
+			//log.Debugf("Unhandled case with NIL IV and likely empty cache record for DCC2Cache %s\n", name)
 			continue
 		}
 	}

