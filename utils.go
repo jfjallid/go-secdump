@@ -91,7 +91,7 @@ func GetOSVersion(currentBuild int, currentVersion float64, server bool) (os byt
 			os = WIN_SERVER_2008_R2
 		case currentBuild >= 9200 && currentBuild < 9600:
 			os = WIN_SERVER_2012
-		case currentBuild >= 9200 && currentBuild < 14393:
+		case currentBuild >= 9600 && currentBuild < 14393:
 			os = WIN_SERVER_2012_R2
 		case currentBuild >= 14393 && currentBuild < 17763:
 			os = WIN_SERVER_2016

