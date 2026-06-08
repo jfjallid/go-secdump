@@ -61,6 +61,8 @@ options:
       --dc-ip <ip>           Optionally specify ip of KDC when using Kerberos authentication
       --target-ip <ip>       Optionally specify ip of target when using Kerberos authentication
       --aes-key <hex>        Use a hex encoded AES128/256 key for Kerberos authentication
+      --keytab-file <file>   Authenticate using keys from a keytab file (implies -k). User and
+                             domain are taken from the first keytab entry if not specified
       --dns-host <ip[:port]> Override system's default DNS resolver
       --dns-tcp              Force DNS lookups over TCP. Default true when using --socks-host
       --dump                 Saves the SAM and SECURITY hives to disk and

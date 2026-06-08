@@ -50,11 +50,12 @@ import (
 	"github.com/jfjallid/go-smb/relay"
 	"github.com/jfjallid/go-smb/smb"
 	"github.com/jfjallid/go-smb/spnego"
+	"github.com/jfjallid/gokrb5/v9/keytab"
 	"github.com/jfjallid/golog"
 )
 
 var log = golog.Get("main")
-var release string = "0.7.0"
+var release string = "0.7.1"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -814,6 +815,8 @@ var helpMsg = `
           --dc-ip <ip>           Optionally specify ip of KDC when using Kerberos authentication
           --target-ip <ip>       Optionally specify ip of target when using Kerberos authentication
           --aes-key <hex>        Use a hex encoded AES128/256 key for Kerberos authentication
+          --keytab-file <file>   Authenticate using keys from a keytab file (implies -k). User and
+                                 domain are taken from the first keytab entry if not specified
           --dns-host <ip[:port]> Override system's default DNS resolver
           --dns-tcp              Force DNS lookups over TCP. Default true when using --socks-host
           --dump                 Saves the SAM and SECURITY hives to disk and
@@ -909,7 +912,7 @@ func matchesAny(name string, tokens []string) bool {
 }
 
 func main() {
-	var host, username, password, hash, domain, socksHost, backupFilename, outputFilename, targetIP, dcIP, aesKey, dnsHost, outputFormat string
+	var host, username, password, hash, domain, socksHost, backupFilename, outputFilename, targetIP, dcIP, aesKey, dnsHost, outputFormat, keytabFile string
 	var port, socksPort, relayPort int
 	var noEnc, forceSMB2, localUser, dump, version, doRelay, noPass, sam, lsaSecrets, dcc2, otherRegistrySecrets, modifyDacl, backupDacl, restoreDacl, kerberos, dnsTCP, history, quiet, listLogPackages bool
 	var debug, verbose logFlag
@@ -969,6 +972,7 @@ func main() {
 	flag.BoolVar(&quiet, "q", false, "")
 	flag.BoolVar(&quiet, "quiet", false, "")
 	flag.StringVar(&outputFormat, "output-format", "text", "")
+	flag.StringVar(&keytabFile, "keytab-file", "", "")
 
 	flag.Parse()
 
@@ -1152,12 +1156,19 @@ func main() {
 		return
 	}
 
+	// A keytab is a Kerberos credential, so authenticating with one implies -k.
+	if keytabFile != "" {
+		kerberos = true
+	}
+
 	if noPass {
 		password = ""
 		hashBytes = nil
 		aesKeyBytes = nil
 	} else {
-		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) {
+		// A keytab is a valid credential source, so don't prompt for a password
+		// when one is supplied.
+		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) && (keytabFile == "") {
 			fmt.Printf("Enter password: ")
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Println()
@@ -1202,7 +1213,7 @@ func main() {
 	}
 
 	if kerberos {
-		smbOptions.Initiator = &spnego.KRB5Initiator{
+		krbInitiator := &spnego.KRB5Initiator{
 			User:        username,
 			Password:    password,
 			Domain:      domain,
@@ -1215,6 +1226,17 @@ func main() {
 			DnsHost:     dnsHost,
 			DnsTCP:      dnsTCP,
 		}
+		if keytabFile != "" {
+			// The initiator authenticates from the keytab and derives a missing
+			// User/Domain from its first entry.
+			kt, kerr := keytab.Load(keytabFile)
+			if kerr != nil {
+				log.Errorf("Failed to load keytab file %s: %s\n", keytabFile, kerr)
+				return
+			}
+			krbInitiator.Keytab = kt
+		}
+		smbOptions.Initiator = krbInitiator
 	} else {
 		smbOptions.Initiator = &spnego.NTLMInitiator{
 			User:      username,
