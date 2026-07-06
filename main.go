@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -55,7 +56,7 @@ import (
 )
 
 var log = golog.Get("main")
-var release string = "0.7.1"
+var release string = "0.7.2"
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -1167,8 +1168,10 @@ func main() {
 		aesKeyBytes = nil
 	} else {
 		// A keytab is a valid credential source, so don't prompt for a password
-		// when one is supplied.
-		if (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) && (keytabFile == "") {
+		// when one is supplied. With no username there is nothing to prompt for
+		// either — Kerberos uses the ccache (KRB5CCNAME) principal — so only
+		// prompt when a username was given without any other credential.
+		if (username != "") && (password == "") && (hashBytes == nil) && (aesKeyBytes == nil) && (keytabFile == "") {
 			fmt.Printf("Enter password: ")
 			passBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Println()
@@ -1311,7 +1314,7 @@ func main() {
 	// Open connection to Windows Remote Registry pipe
 	f, err := session.OpenFile(share, msrrp.MSRRPPipe)
 	if err != nil {
-		if err == smb.StatusMap[smb.StatusPipeNotAvailable] {
+		if errors.Is(err, smb.StatusMap[smb.StatusPipeNotAvailable]) {
 			// RemoteRegistry is not running but by requesting the pipe name it might be automatically started!
 			time.Sleep(time.Second * 2)
 			f, err = session.OpenFile(share, msrrp.MSRRPPipe)
